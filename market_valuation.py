@@ -1,0 +1,451 @@
+import datetime as dt
+from pathlib import Path
+import matplotlib.pyplot as plt
+import pandas as pd
+import wbdata
+import yfinance as yf
+import numpy as np
+import httpx
+
+# TODO: implement more up-to-date CPI source
+# TODO: add longer history for SP500 earnings
+
+# Cache directory for downloaded data
+CACHE_DIR = Path(__file__).parent / "data_cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+def fetch_yfinance(ticker="^GSPC", auto_adjust=True, period="max", interval="1d") -> pd.Series:
+    """Download the S&P 500 index and return daily closes."""
+    # Create cache filename
+    adj_str = "adj" if auto_adjust else "noadj"
+    filename = f"{ticker.replace('^', '')}_{interval}_{period}_{adj_str}.pkl"
+    cache_path = CACHE_DIR / filename
+    
+    # Check if file exists and was modified today
+    should_download = True
+    if cache_path.exists():
+        file_mod_time = dt.datetime.fromtimestamp(cache_path.stat().st_mtime)
+        if file_mod_time.date() == dt.datetime.now().date():
+            should_download = False
+    
+    # Download if needed
+    if should_download:
+        data = yf.download(ticker, auto_adjust=auto_adjust, period=period, interval=interval)
+        if data.empty:
+            raise ValueError(f"No data returned for {ticker}.")
+        data.to_pickle(cache_path)
+    else:
+        data = pd.read_pickle(cache_path)
+    
+    # Handle multi-level columns (ticker level)
+    if isinstance(data.columns, pd.MultiIndex):
+        closes = data["Close"][ticker].dropna()
+    else:
+        closes = data["Close"].dropna()
+    
+    return closes
+
+def fetch_wbdata() -> pd.Series:
+    """Fetch market cap and GDP data from World Bank."""
+    # only annual data available so not used anymore
+    COUNTRY_ISO = "USA"
+    GDP_IND = "NY.GDP.MKTP.CD"
+    MARKET_CAP_IND = "CM.MKT.LCAP.CD"
+    indicators = {MARKET_CAP_IND: "market_cap", GDP_IND: "gdp"}
+    raw = wbdata.get_dataframe(indicators, country=COUNTRY_ISO)
+    raw = raw.sort_index()
+    return raw
+
+def fetch_fred_csv(id: str) -> pd.Series:
+    """Fetch a time series in csv from FRED and cache it locally."""
+    # FRED's python API needs an API key, so I use direct CSV download
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
+    filename = id + ".csv"
+    cache_path = CACHE_DIR / filename
+    
+    # Check if file exists and was modified today
+    should_download = True
+    if cache_path.exists():
+        file_mod_time = dt.datetime.fromtimestamp(cache_path.stat().st_mtime)
+        if file_mod_time.date() == dt.datetime.now().date():
+            should_download = False
+    
+    # Download if needed
+    if should_download:
+        df = pd.read_csv(url, parse_dates=["observation_date"])
+        df.to_csv(cache_path, index=False)
+    else:
+        df = pd.read_csv(cache_path, parse_dates=["observation_date"])
+    
+    df[id] = pd.to_numeric(df[id].replace(".", pd.NA), errors="raise")
+    series = df.set_index("observation_date")[id].dropna().sort_index()
+    return series.rename(id)
+
+def fetch_sp500_earnings() -> pd.Series:
+    """Fetch S&P 500 earnings data from S&P Global and cache it locally."""
+    url = "https://www.spglobal.com/spdji/en/documents/additional-material/sp-500-eps-est.xlsx"
+    filename = "sp-500-eps-est.xlsx"
+    cache_path = CACHE_DIR / filename
+    
+    # Check if file exists and was modified today
+    should_download = True
+    if cache_path.exists():
+        file_mod_time = dt.datetime.fromtimestamp(cache_path.stat().st_mtime)
+        if file_mod_time.date() == dt.datetime.now().date():
+            should_download = False
+    
+    # Download if needed (Excel file, not CSV)
+    if should_download:
+
+        URL = "https://www.spglobal.com/spdji/en/documents/additional-material/sp-500-eps-est.xlsx"
+        headers = {
+            # Copy a recent Chrome UA from your machine (DevTools > Network)
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/126.0.0.0 Safari/537.36"),
+            "Accept": "application/octet-stream,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            # Intentionally no Referer because pasting URL in a new tab has none
+            # Add the “sec-ch-ua*” and “sec-fetch-*” hints many CDNs expect:
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+            "Pragma": "no-cache",
+            "Cache-Control": "no-cache",
+        }
+        with httpx.Client(http2=True, headers=headers, follow_redirects=True, timeout=60) as client:
+            r = client.get(URL)
+            r.raise_for_status()
+            ct = r.headers.get("Content-Type", "")
+            # XLSX should be one of these MIME types:
+            assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ct or "application/octet-stream" in ct, ct
+            with open(cache_path, "wb") as f:
+                f.write(r.content)
+        print("saved sp-500-eps-est.xlsx")
+
+    df = pd.read_excel(cache_path, sheet_name='QUARTERLY DATA', header=None, skiprows=6)
+    df = df[[0, 2]] # date and quarterly earnings as reported per share
+    df = df.dropna() # drop missing values
+    df.columns = ['date', 'earnings'] # name the columns
+    df['date'] = pd.to_datetime(df['date'], errors='raise') # ensure date is datetime    
+    df['earnings'] = pd.to_numeric(df['earnings'], errors='raise') # ensure earnings is numeric
+   
+    # Set index and create series
+    earnings_series = df.set_index('date')['earnings'].sort_index()
+    # Calculate trailing 12-month (4 quarters) earnings
+    earnings_12m = earnings_series.rolling(window=4).sum().dropna()
+    # Set series name
+    earnings_12m.name = "SP500_Earnings"
+
+    return earnings_12m
+
+def calculate_cape_ratio(averaging_years: int = 10) -> pd.Series:
+    """Calculate (Shiller's-like) CAPE (Cyclically Adjusted Price-to-Earnings) ratio.
+    
+    Args:
+        averaging_years: Number of years to average earnings over (default: 10 years)
+
+    Returns:
+        Time series of CAPE ratio values
+    """
+    # Fetch S&P 500 prices
+    prices = fetch_yfinance('^GSPC', auto_adjust=False)
+    # Convert prices to monthly (end of month)
+    prices = prices.resample('D').ffill()
+
+    # Fetch S&P 500 earnings
+    earnings = fetch_sp500_earnings()
+    # Interpolate to get smooth evolution
+    earnings = earnings.resample('D').interpolate(method='linear')
+    
+    # Fetch CPI data
+    cpi = fetch_fred_csv("CPIAUCNS") # a bit outdated source
+    # Interpolate to get smooth evolution
+    # cpi.index = cpi.index + pd.Timedelta(days=14) # shift to the middle of the month
+    cpi = cpi.resample('ME').last() # resample from month start to month end
+    cpi = cpi.resample('D').interpolate(method='linear')
+    
+    # Align all series to the same index
+    earnings = earnings.reindex(prices.index, method='ffill').dropna()
+    cpi = cpi.reindex(prices.index, method='ffill').dropna()
+
+    # Adjust for inflation (normalize to latest CPI value)
+    latest_cpi = cpi.iloc[-1]
+    real_prices = prices * (latest_cpi / cpi)
+    real_earnings = earnings * (latest_cpi / cpi)
+
+    # Calculate rolling average of real earnings
+    avg_real_earnings = real_earnings.rolling(window=averaging_years * 365, min_periods=averaging_years * 365).mean()
+    
+    # Calculate CAPE ratio
+    cape_ratio = real_prices / avg_real_earnings
+    cape_ratio.name = f"CAPE Ratio ({averaging_years}yr)"
+    
+    return cape_ratio.dropna()
+
+def fetch_us_gdp_and_gdpnow() -> pd.Series:
+    """Fetch US GDP and extend it with GDPNow estimates."""
+    # alternatively, there is python API but it requires an API key
+    # fetch GDP and GDPNOW from FRED
+    gdp = fetch_fred_csv("GDP")
+    gdp_now_annualized = fetch_fred_csv("GDPNOW")
+    # take only GDPNOW entries after last GDP date
+    last_gdp_date = gdp.index.max()
+    gdpnow_new = gdp_now_annualized[gdp_now_annualized.index > last_gdp_date]
+    if gdpnow_new.empty:
+        return gdp
+    last_gdp = gdp.iloc[-1]
+    # Calculate actual time periods in years from previous point
+    days_elapsed = gdpnow_new.index.to_series().diff().fillna(gdpnow_new.index[0] - last_gdp_date)
+    years_elapsed = days_elapsed.dt.days / 365
+    # Convert annualized growth rates to actual period growth factors
+    growth_factors = (1 + gdpnow_new.div(100.0)) ** years_elapsed.values
+    gdp_extension = (last_gdp * growth_factors.cumprod()).rename("GDP")
+    extended_gdp = pd.concat([gdp, gdp_extension])
+    return extended_gdp
+
+def calculate_buffett_indicator() -> pd.Series:
+    """Calculate the Buffett Indicator (Market Cap / GDP ratio).
+    
+    Args:
+        exponential_fit: If True, fit an exponential trend and return the ratio
+                        divided by the exponential fit (detrended ratio).
+        detrend: If True and exponential_fit is True, return detrended data
+    """
+    # Fetch market cap data
+    market_cap = fetch_yfinance('^FTW5000')
+    # Fetch GDP data with GDPNow extension
+    gdp_data = fetch_us_gdp_and_gdpnow()
+    # Resample GDP to daily and forward fill
+    gdp_data = gdp_data.resample('D').ffill()
+    # Align GDP to market cap dates
+    gdp_aligned = gdp_data.reindex(market_cap.index, method='ffill').dropna()
+    # Calculate ratio
+    ratio = market_cap / gdp_aligned
+    ratio.name = "Buffett Indicator"
+    
+    return ratio
+
+def detect_bear_markets(series: pd.Series, threshold: float = 0.20) -> list:
+    """Detect bear market periods (decline of threshold% or more from peak)."""
+    cleaned_series = series.dropna()
+    if cleaned_series.empty:
+        return []
+
+    bear_periods = []
+    max_price = cleaned_series.iloc[0]
+    max_date = cleaned_series.index[0]
+    min_price, min_date = None, None
+    in_bear = False
+    start = None
+
+    for date, price in cleaned_series.iloc[1:].items():
+        if price >= max_price:
+            if in_bear:
+                bear_periods.append((start, min_date))
+                in_bear = False
+            max_price = price
+            max_date = date
+            continue
+        if in_bear and price < min_price:
+            min_price = price
+            min_date = date
+            continue
+        drawdown = (max_price - price) / max_price
+        if drawdown >= threshold and not in_bear:
+            in_bear = True
+            start = max_date
+            min_price = price
+            min_date = date
+    if in_bear:
+        bear_periods.append((start, cleaned_series.index[-1]))
+
+    return bear_periods
+
+def fit_exponential(series: pd.Series, detrend: bool = False, trends: bool = True) -> pd.DataFrame:
+    """Fit an exponential trend to a time series and return with confidence bands.
+    
+    Args:
+        series: Time series to fit
+        detrend: If True, return detrended data, otherwise return original with fit overlay
+        
+    Returns:
+        DataFrame with original/detrended series, exponential fit, and std dev bands
+    """
+    # Convert dates to numeric (days since start)
+    x = (series.index - series.index[0]).days.values
+    y = series.values
+    
+    # Fit exponential: y = a * exp(b * x)
+    # Using log transform: log(y) = log(a) + b * x
+    log_y = np.log(y)
+    coeffs = np.polyfit(x, log_y, 1)
+    b, log_a = coeffs[0], coeffs[1]
+    
+    # Calculate fitted values
+    y_fit = np.exp(log_a + b * x)
+    
+    # Detrend the data first
+    detrended_y = y / y_fit
+    
+    # Calculate residuals and standard deviation from detrended data
+    residuals = detrended_y - 1.0  # Mean of detrended data is 1.0
+    std_dev = np.std(residuals)
+    
+    if detrend:
+        series = pd.Series(detrended_y, index=series.index, name=f"{series.name} (detrended)")
+        if not trends:
+            return series
+        base_trend = pd.Series(np.ones_like(y_fit), index=series.index, name=f"{series.name} exp fit")
+    else:
+        if not trends:
+            return series
+        base_trend = pd.Series(y_fit, index=series.index, name=f"{series.name} exp fit")
+    bands = [series, base_trend]
+    std_devs = [1, 2]
+    for n in std_devs:
+        bands.append(pd.Series(base_trend * (1 + n * std_dev), index=series.index, name=f"{series.name} exp +{n} SD"))
+        bands.append(pd.Series(base_trend * (1 - n * std_dev), index=series.index, name=f"{series.name} exp -{n} SD"))
+    result = pd.concat(bands, axis=1)
+    
+    return result
+
+def common_date_range(*datasets):
+    """Return copies of datasets limited to their shared date range."""
+    if not datasets:
+        return []
+    min_dates, max_dates = [], []
+    for data in datasets:
+        if data.empty:
+            raise ValueError("Datasets must be non-empty.")
+        if not isinstance(data.index, pd.DatetimeIndex):
+            raise TypeError("All datasets must use a DatetimeIndex.")
+        min_dates.append(data.index.min())
+        max_dates.append(data.index.max())
+    common_start = max(min_dates)
+    common_end = min(max_dates)
+    if common_start > common_end:
+        raise ValueError("Datasets do not share a common date range.")
+    return [data.loc[(data.index >= common_start) & (data.index <= common_end)] for data in datasets]
+
+def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, normalize_left=False, normalize_right=False) -> None:
+    """Plot datasets on dual y-axes with optional normalization.
+    
+    Args:
+        left_dataset: Single Series/DataFrame or list of Series/DataFrames for left axis
+        right_dataset: Single Series/DataFrame or list of Series/DataFrames for right axis
+        bear_markets: List of (start, end) tuples for bear market periods
+        normalize_left: If True, normalize left axis datasets to their maximum
+        normalize_right: If True, normalize right axis datasets to their maximum
+    """
+    fig, ax1 = plt.subplots(figsize=(14, 8))
+    
+    # Draw bear market periods
+    if bear_markets:
+        for idx, (start, end) in enumerate(bear_markets):
+            ax1.axvspan(start, end, alpha=0.2, color="gray", label="Bear Markets" if idx == 0 else "")
+    
+    # Normalize function
+    def normalize_dataset(data):
+        """Normalize dataset by maximum of first column/series."""
+        if isinstance(data, pd.DataFrame):
+            # For DataFrame, divide all columns by the maximum of the first column
+            first_col_max = data.iloc[:, 0].max()
+            return data / first_col_max
+        else:
+            # For Series, divide by maximum value
+            return data / data.max()
+    
+    # Convert single datasets to lists
+    left_datasets = left_dataset if isinstance(left_dataset, list) else [left_dataset]
+    right_datasets = right_dataset if isinstance(right_dataset, list) else [right_dataset]
+    
+    # Apply normalization if requested
+    if normalize_left:
+        left_datasets = [normalize_dataset(ds) for ds in left_datasets]
+    if normalize_right:
+        right_datasets = [normalize_dataset(ds) for ds in right_datasets]
+    
+    # Plot left axis datasets
+    left_color = "tab:blue"
+    left_colors = plt.cm.Blues(np.linspace(1.0, 0.4, len(left_datasets)))
+    ax1.set_xlabel("Date")
+    
+    left_labels = []
+    for idx, data in enumerate(left_datasets):
+        if isinstance(data, pd.DataFrame):
+            # Use only the first column's name as the label for the entire DataFrame
+            label = str(data.columns[0])
+            # Plot first column with label, rest without
+            for col_idx, col in enumerate(data.columns):
+                if col_idx == 0:
+                    ax1.plot(data.index, data[col], color=left_colors[idx], label=label)
+                else:
+                    ax1.plot(data.index, data[col], color=left_colors[idx])
+            left_labels.append(label)
+        else:
+            label = getattr(data, "name", None) or f"Left {idx+1}"
+            data.plot(ax=ax1, color=left_colors[idx], label=label, legend=False)
+            left_labels.append(label)
+    
+    left_ylabel = "Normalized" if normalize_left else (left_labels[0] if len(left_labels) == 1 else "Left Axis")
+    ax1.set_ylabel(left_ylabel, color=left_color)
+    ax1.tick_params(axis="y", labelcolor=left_color)
+    ax1.grid(True, alpha=0.3)
+
+    # Plot right axis datasets
+    ax2 = ax1.twinx()
+    right_color = "tab:red"
+    right_colors = plt.cm.Reds(np.linspace(1.0, 0.4, len(right_datasets)))
+    
+    right_labels = []
+    for idx, data in enumerate(right_datasets):
+        if isinstance(data, pd.DataFrame):
+            # Use only the first column's name as the label for the entire DataFrame
+            label = str(data.columns[0])
+            # Plot first column with label, rest without
+            for col_idx, col in enumerate(data.columns):
+                if col_idx == 0:
+                    ax2.plot(data.index, data[col], color=right_colors[idx], alpha=0.7, label=label)
+                else:
+                    ax2.plot(data.index, data[col], color=right_colors[idx], alpha=0.7)
+            right_labels.append(label)
+        else:
+            label = getattr(data, "name", None) or f"Right {idx+1}"
+            data.plot(ax=ax2, color=right_colors[idx], alpha=0.7, label=label, legend=False)
+            right_labels.append(label)
+    
+    right_ylabel = "Normalized" if normalize_right else (right_labels[0] if len(right_labels) == 1 else "Right Axis")
+    ax2.set_ylabel(right_ylabel, color=right_color)
+    ax2.tick_params(axis="y", labelcolor=right_color)
+    
+    # Set title
+    title_left = left_ylabel if len(left_labels) == 1 else f"{len(left_labels)} series"
+    title_right = right_ylabel if len(right_labels) == 1 else f"{len(right_labels)} series"
+    ax1.set_title(f"{title_left} vs {title_right}")
+    
+    # Combine legends
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    if lines1 or lines2:
+        ax1.legend(lines1 + lines2, labels1 + labels2)
+    
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    # Fetch both datasets
+    sp500 = fetch_yfinance('^GSPC', auto_adjust=True).rename("S&P 500 Index")
+    ratio = calculate_buffett_indicator().resample('D').ffill()
+    ratio = fit_exponential(ratio, detrend=True, trends=False)
+    cape = calculate_cape_ratio(averaging_years=1).resample('D').ffill()
+    ti10y = fetch_fred_csv("DGS10").resample('D').ffill().rename("10Y Treasury Yield")
+
+    # Filter to common date range
+    # sp500, ratio, cape, ti10y = common_date_range(sp500, ratio, cape, ti10y)
+
+    # Detect bear markets in S&P 500
+    bear_markets = detect_bear_markets(sp500, threshold=0.18)
+
+    plot_dual_axis(sp500, [ratio, cape, ti10y], bear_markets, normalize_right=True)
