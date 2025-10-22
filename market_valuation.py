@@ -1,3 +1,4 @@
+import math
 import datetime as dt
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -7,8 +8,9 @@ import yfinance as yf
 import numpy as np
 import httpx
 
-# TODO: implement more up-to-date CPI source
 # TODO: add longer history for SP500 earnings
+# TODO: add x-axis labels with financial crises (e.g. dot-com bubble in 2000)
+# TODO: ?add seasonal trends to CPI prediction from historical seasonally adjusted vs non-adjusted data
 
 # Cache directory for downloaded data
 CACHE_DIR = Path(__file__).parent / "data_cache"
@@ -140,6 +142,35 @@ def fetch_sp500_earnings() -> pd.Series:
 
     return earnings_12m
 
+def fetch_CPI(extrapolate=True, ema_span=12) -> pd.Series:
+    """Fetch Consumer Price Index (CPI) data from FRED and process it."""
+    # Fetch CPI data
+    cpi = fetch_fred_csv("CPIAUCNS")
+    # Shift to middle of month
+    cpi = cpi.resample('MS').mean()
+    cpi.index = cpi.index + pd.Timedelta(days=14)
+    if extrapolate is True:
+        # Calculate number of months to extrapolate from last CPI date to today
+        days_diff = (pd.Timestamp.now() - cpi.index[-1]).days
+        extrapolate = int(math.ceil(days_diff / 28)) # rather more than less
+    if extrapolate > 0:
+        # Extrapolate n_extrapolate additional months using exponential moving average on the trend
+        growth_rates = cpi.pct_change().dropna() # month-over-month growth rates
+        ema_growth = growth_rates.ewm(span=ema_span).mean().iloc[-1] # exponential moving average of growth rate
+        # Generate extrapolated values
+        extrapolated_dates = pd.date_range(start=cpi.index[-1] + pd.DateOffset(months=1), periods=extrapolate, freq=pd.DateOffset(months=1))
+        # extrapolated_values = [cpi.iloc[-1] * (1 + ema_growth) ** (i + 1) for i in range(extrapolate)]
+        extrapolated_values = [cpi.iloc[-1] * (1 + ema_growth) ** (2-2**(-i)) for i in range(extrapolate)] # conservative version
+        # extrapolated_values = [cpi.iloc[-1] * (1 + ema_growth) ** (1-2**(-i-1)) for i in range(extrapolate)] # 2nd conservative version
+        # Create series and append
+        extrapolated_series = pd.Series(extrapolated_values, index=extrapolated_dates)
+        cpi = pd.concat([cpi, extrapolated_series])
+    # Interpolate to get smooth evolution
+    cpi = cpi.resample('D').interpolate(method='linear')
+    # Limit to current date
+    cpi = cpi[cpi.index <= pd.Timestamp.now()]
+    return cpi.rename("CPI")
+
 def calculate_cape_ratio(averaging_years: int = 10) -> pd.Series:
     """Calculate (Shiller's-like) CAPE (Cyclically Adjusted Price-to-Earnings) ratio.
     
@@ -160,11 +191,7 @@ def calculate_cape_ratio(averaging_years: int = 10) -> pd.Series:
     earnings = earnings.resample('D').interpolate(method='linear')
     
     # Fetch CPI data
-    cpi = fetch_fred_csv("CPIAUCNS") # a bit outdated source
-    # Interpolate to get smooth evolution
-    # cpi.index = cpi.index + pd.Timedelta(days=14) # shift to the middle of the month
-    cpi = cpi.resample('ME').last() # resample from month start to month end
-    cpi = cpi.resample('D').interpolate(method='linear')
+    cpi = fetch_CPI()
     
     # Align all series to the same index
     earnings = earnings.reindex(prices.index, method='ffill').dropna()
@@ -313,6 +340,7 @@ def fit_exponential(series: pd.Series, detrend: bool = False, trends: bool = Tru
 
 def common_date_range(*datasets):
     """Return copies of datasets limited to their shared date range."""
+    filter_max = False # filter to the earliest common end date?
     if not datasets:
         return []
     min_dates, max_dates = [], []
@@ -324,7 +352,10 @@ def common_date_range(*datasets):
         min_dates.append(data.index.min())
         max_dates.append(data.index.max())
     common_start = max(min_dates)
-    common_end = min(max_dates)
+    if filter_max:
+        common_end = min(max_dates)
+    else:
+        common_end = max(max_dates)
     if common_start > common_end:
         raise ValueError("Datasets do not share a common date range.")
     return [data.loc[(data.index >= common_start) & (data.index <= common_end)] for data in datasets]
@@ -437,15 +468,16 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, normalize_lef
 if __name__ == "__main__":
     # Fetch both datasets
     sp500 = fetch_yfinance('^GSPC', auto_adjust=True).rename("S&P 500 Index")
-    ratio = calculate_buffett_indicator().resample('D').ffill()
-    ratio = fit_exponential(ratio, detrend=True, trends=False)
-    cape = calculate_cape_ratio(averaging_years=1).resample('D').ffill()
+    buffet = calculate_buffett_indicator().resample('D').ffill()
+    buffet = fit_exponential(buffet, detrend=True, trends=False)
+    # cape3 = calculate_cape_ratio(averaging_years=3).resample('D').ffill()
+    cape10 = calculate_cape_ratio(averaging_years=10).resample('D').ffill()
     ti10y = fetch_fred_csv("DGS10").resample('D').ffill().rename("10Y Treasury Yield")
 
     # Filter to common date range
-    # sp500, ratio, cape, ti10y = common_date_range(sp500, ratio, cape, ti10y)
+    sp500, buffet, cape10, ti10y = common_date_range(sp500, buffet, cape10, ti10y)
 
     # Detect bear markets in S&P 500
-    bear_markets = detect_bear_markets(sp500, threshold=0.18)
+    bear_markets = detect_bear_markets(sp500, threshold=0.2)
 
-    plot_dual_axis(sp500, [ratio, cape, ti10y], bear_markets, normalize_right=True)
+    plot_dual_axis(sp500, [buffet, cape10, ti10y], bear_markets, normalize_right=True)
