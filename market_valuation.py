@@ -340,7 +340,7 @@ def fit_exponential(series: pd.Series, detrend: bool = False, trends: bool = Tru
 
 def common_date_range(*datasets):
     """Return copies of datasets limited to their shared date range."""
-    filter_max = False # filter to the earliest common end date?
+    filter_max = True # filter to the earliest common end date?
     if not datasets:
         return []
     min_dates, max_dates = [], []
@@ -470,14 +470,15 @@ if __name__ == "__main__":
     sp500 = fetch_yfinance('^GSPC', auto_adjust=True).rename("S&P 500 Index")
     buffet = calculate_buffett_indicator().resample('D').ffill()
     buffet = fit_exponential(buffet, detrend=True, trends=False)
-    # cape3 = calculate_cape_ratio(averaging_years=3).resample('D').ffill()
     cape10 = calculate_cape_ratio(averaging_years=10).resample('D').ffill()
     ti10y = fetch_fred_csv("DGS10").resample('D').ffill().rename("10Y Treasury Yield")
-
-    # Filter to common date range
-    sp500, buffet, cape10, ti10y = common_date_range(sp500, buffet, cape10, ti10y)
 
     # Detect bear markets in S&P 500
     bear_markets = detect_bear_markets(sp500, threshold=0.2)
 
     plot_dual_axis(sp500, [buffet, cape10, ti10y], bear_markets, normalize_right=True)
+
+    sp500, cape10, ti10y = common_date_range(sp500, cape10, ti10y) # filter to common date range
+    earnings_ratio = cape10*ti10y/100.0
+    earnings_ratio.name = "10Y Treasury Yield / S&P real earnings"
+    plot_dual_axis(sp500, [earnings_ratio], bear_markets, normalize_right=False)
