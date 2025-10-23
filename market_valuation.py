@@ -8,13 +8,17 @@ import yfinance as yf
 import numpy as np
 import httpx
 
-# TODO: add longer history for SP500 earnings
+# TODO: plot excess cape yield
+# TODO: CPI adjusted treasury yield? Check Shiller's work
 # TODO: add x-axis labels with financial crises (e.g. dot-com bubble in 2000)
 # TODO: ?add seasonal trends to CPI prediction from historical seasonally adjusted vs non-adjusted data
 
 # Cache directory for downloaded data
 CACHE_DIR = Path(__file__).parent / "data_cache"
 CACHE_DIR.mkdir(exist_ok=True)
+# Data directory for historical data
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
 
 def fetch_yfinance(ticker="^GSPC", auto_adjust=True, period="max", interval="1d") -> pd.Series:
     """Download the S&P 500 index and return daily closes."""
@@ -84,8 +88,7 @@ def fetch_fred_csv(id: str) -> pd.Series:
     return series.rename(id)
 
 def fetch_sp500_earnings() -> pd.Series:
-    """Fetch S&P 500 earnings data from S&P Global and cache it locally."""
-    url = "https://www.spglobal.com/spdji/en/documents/additional-material/sp-500-eps-est.xlsx"
+    """Fetch S&P 500 earnings data from S&P Global, cache it locally, and combine with historical data."""
     filename = "sp-500-eps-est.xlsx"
     cache_path = CACHE_DIR / filename
     
@@ -124,23 +127,25 @@ def fetch_sp500_earnings() -> pd.Series:
             assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ct or "application/octet-stream" in ct, ct
             with open(cache_path, "wb") as f:
                 f.write(r.content)
-        print("saved sp-500-eps-est.xlsx")
+        print("Saved updated S&P 500 earnings data.")
 
-    df = pd.read_excel(cache_path, sheet_name='QUARTERLY DATA', header=None, skiprows=6)
-    df = df[[0, 2]] # date and quarterly earnings as reported per share
-    df = df.dropna() # drop missing values
-    df.columns = ['date', 'earnings'] # name the columns
-    df['date'] = pd.to_datetime(df['date'], errors='raise') # ensure date is datetime    
-    df['earnings'] = pd.to_numeric(df['earnings'], errors='raise') # ensure earnings is numeric
-   
-    # Set index and create series
-    earnings_series = df.set_index('date')['earnings'].sort_index()
-    # Calculate trailing 12-month (4 quarters) earnings
-    earnings_12m = earnings_series.rolling(window=4).sum().dropna()
+    df = pd.read_excel(cache_path, sheet_name='QUARTERLY DATA', header=None, skiprows=6, usecols=[0,2], index_col=0, parse_dates=True).squeeze()
+    df = df.dropna().sort_index() # drop missing values and sort
+    df = pd.to_numeric(df, errors='raise') # ensure earnings are numeric
+    df = df.rolling(window=4).sum().dropna() # calculate trailing 12-month (4 quarters)
+
+    # Load historical data from local CSV
+    df_history = pd.read_csv(DATA_DIR / "SP500EARNINGS.csv", index_col=0, parse_dates=True, dayfirst=True).squeeze()
+    df_history = df_history.dropna().sort_index() # drop missing values and sort
+    df_history = pd.to_numeric(df_history, errors='raise') # ensure earnings are numeric
+    df_history = df_history[df_history.index < df.index[0]] # take only historical data before fetched data
+
+    # Combine historical data with fetched data
+    df = pd.concat([df_history, df])
+
     # Set series name
-    earnings_12m.name = "SP500_Earnings"
-
-    return earnings_12m
+    df.name = "SP500_Earnings"
+    return df
 
 def fetch_CPI(extrapolate=True, ema_span=12) -> pd.Series:
     """Fetch Consumer Price Index (CPI) data from FRED and process it."""
@@ -480,5 +485,5 @@ if __name__ == "__main__":
 
     sp500, cape10, ti10y = common_date_range(sp500, cape10, ti10y) # filter to common date range
     earnings_ratio = cape10*ti10y/100.0
-    earnings_ratio.name = "10Y Treasury Yield / S&P real earnings"
+    earnings_ratio.name = "10Y Treasury Yield / S&P Earnings Yield"
     plot_dual_axis(sp500, [earnings_ratio], bear_markets, normalize_right=False)
