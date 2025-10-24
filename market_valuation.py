@@ -11,6 +11,7 @@ import httpx
 # TODO: plot excess cape yield
 # TODO: CPI adjusted treasury yield? Check Shiller's work
 # TODO: add x-axis labels with financial crises (e.g. dot-com bubble in 2000)
+# TODO: ?implement exponential moving average for smoothing inflation
 # TODO: ?add seasonal trends to CPI prediction from historical seasonally adjusted vs non-adjusted data
 
 # Cache directory for downloaded data
@@ -147,7 +148,7 @@ def fetch_sp500_earnings() -> pd.Series:
     df.name = "SP500_Earnings"
     return df
 
-def fetch_CPI(extrapolate=True, ema_span=12) -> pd.Series:
+def fetch_CPI(extrapolate=True, ema_span=12, interpolate=True) -> pd.Series:
     """Fetch Consumer Price Index (CPI) data from FRED and process it."""
     # Fetch CPI data
     cpi = fetch_fred_csv("CPIAUCNS")
@@ -171,12 +172,21 @@ def fetch_CPI(extrapolate=True, ema_span=12) -> pd.Series:
         extrapolated_series = pd.Series(extrapolated_values, index=extrapolated_dates)
         cpi = pd.concat([cpi, extrapolated_series])
     # Interpolate to get smooth evolution
-    cpi = cpi.resample('D').interpolate(method='linear')
+    if interpolate:
+        cpi = cpi.resample('D').interpolate(method='linear')
     # Limit to current date
     cpi = cpi[cpi.index <= pd.Timestamp.now()]
     return cpi.rename("CPI")
 
-def calculate_cape_ratio(averaging_years: int = 10) -> pd.Series:
+def fetch_inflation(averaging_years=10) -> float:
+    """Fetch the inflation rate based on CPI averaged over the last `span` months."""
+    cpi = fetch_CPI()
+    ratio = cpi / cpi.shift(averaging_years*365)
+    ratio_anualized = ratio.dropna() ** (1/averaging_years)
+    inflation = ratio_anualized - 1.0
+    return inflation.rename("Inflation")
+
+def calc_cape_ratio(averaging_years: int = 10) -> pd.Series:
     """Calculate (Shiller's-like) CAPE (Cyclically Adjusted Price-to-Earnings) ratio.
     
     Args:
@@ -186,9 +196,7 @@ def calculate_cape_ratio(averaging_years: int = 10) -> pd.Series:
         Time series of CAPE ratio values
     """
     # Fetch S&P 500 prices
-    prices = fetch_yfinance('^GSPC', auto_adjust=False)
-    # Convert prices to monthly (end of month)
-    prices = prices.resample('D').ffill()
+    prices = fetch_yfinance('^GSPC', auto_adjust=False).resample('D').ffill()
 
     # Fetch S&P 500 earnings
     earnings = fetch_sp500_earnings()
@@ -199,8 +207,8 @@ def calculate_cape_ratio(averaging_years: int = 10) -> pd.Series:
     cpi = fetch_CPI()
     
     # Align all series to the same index
-    earnings = earnings.reindex(prices.index, method='ffill').dropna()
-    cpi = cpi.reindex(prices.index, method='ffill').dropna()
+    earnings = earnings.reindex(prices.index, method='ffill')
+    cpi = cpi.reindex(prices.index, method='ffill')
 
     # Adjust for inflation (normalize to latest CPI value)
     latest_cpi = cpi.iloc[-1]
@@ -215,6 +223,36 @@ def calculate_cape_ratio(averaging_years: int = 10) -> pd.Series:
     cape_ratio.name = f"CAPE Ratio ({averaging_years}yr)"
     
     return cape_ratio.dropna()
+
+def calc_treasury_cape_ratio(averaging_years: int = 10) -> pd.Series:
+    """Calculate 10Y Treasury to CAPE yield ratio.
+    
+    Args:
+        averaging_years: Number of years to average earnings over (default: 10 years)
+    """
+    cape = calc_cape_ratio(averaging_years=averaging_years).resample('D').ffill()
+    ti10y = fetch_fred_csv("DGS10")
+    # Align all series to the same index
+    ti10y = ti10y.reindex(cape.index, method='ffill')
+    # Calculate CAPE to Treasury yield ratio and drop NA values
+    cape_ti10y_ratio = (cape * ti10y / 100.0).dropna()
+    return cape_ti10y_ratio.rename(f"10Y Treasury Yield / CAPE Yield ({averaging_years}yr) Ratio")
+
+def calc_excess_cape_yield(averaging_years: int = 10) -> pd.Series:
+    """Calculate excess CAPE yield (CAPE earnings yield - 10Y Treasury yield).
+    
+    Args:
+        averaging_years: Number of years to average earnings over (default: 10 years)
+    """
+    cape = calc_cape_ratio(averaging_years=averaging_years).resample('D').ffill()
+    ti10y = fetch_fred_csv("DGS10")
+    inflation = fetch_inflation(averaging_years=averaging_years)
+    # Align all series to the same index
+    ti10y = ti10y.reindex(cape.index, method='ffill')
+    inflation = inflation.reindex(cape.index, method='ffill')
+    # Calculate excess CAPE yield and drop NA values
+    excess_cape_yield = (1.0/cape - ti10y/100.0 + inflation).dropna()
+    return excess_cape_yield.rename(f"Excess CAPE Yield ({averaging_years}yr)")
 
 def fetch_us_gdp_and_gdpnow() -> pd.Series:
     """Fetch US GDP and extend it with GDPNow estimates."""
@@ -237,7 +275,7 @@ def fetch_us_gdp_and_gdpnow() -> pd.Series:
     extended_gdp = pd.concat([gdp, gdp_extension])
     return extended_gdp
 
-def calculate_buffett_indicator() -> pd.Series:
+def calc_buffett_indicator() -> pd.Series:
     """Calculate the Buffett Indicator (Market Cap / GDP ratio).
     
     Args:
@@ -246,18 +284,16 @@ def calculate_buffett_indicator() -> pd.Series:
         detrend: If True and exponential_fit is True, return detrended data
     """
     # Fetch market cap data
-    market_cap = fetch_yfinance('^FTW5000')
+    market_cap = fetch_yfinance('^FTW5000').resample('D').ffill()
     # Fetch GDP data with GDPNow extension
     gdp_data = fetch_us_gdp_and_gdpnow()
-    # Resample GDP to daily and forward fill
-    gdp_data = gdp_data.resample('D').ffill()
     # Align GDP to market cap dates
-    gdp_aligned = gdp_data.reindex(market_cap.index, method='ffill').dropna()
+    gdp_aligned = gdp_data.reindex(market_cap.index, method='ffill')
     # Calculate ratio
     ratio = market_cap / gdp_aligned
     ratio.name = "Buffett Indicator"
     
-    return ratio
+    return ratio.dropna()
 
 def detect_bear_markets(series: pd.Series, threshold: float = 0.20) -> list:
     """Detect bear market periods (decline of threshold% or more from peak)."""
@@ -473,17 +509,22 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, normalize_lef
 if __name__ == "__main__":
     # Fetch both datasets
     sp500 = fetch_yfinance('^GSPC', auto_adjust=True).rename("S&P 500 Index")
-    buffet = calculate_buffett_indicator().resample('D').ffill()
+    buffet = calc_buffett_indicator()
     buffet = fit_exponential(buffet, detrend=True, trends=False)
-    cape10 = calculate_cape_ratio(averaging_years=10).resample('D').ffill()
+    cape10 = calc_cape_ratio(averaging_years=10).resample('D').ffill()
     ti10y = fetch_fred_csv("DGS10").resample('D').ffill().rename("10Y Treasury Yield")
+    print(sp500)
+    print(buffet)
+    print(cape10)
+    print(ti10y)
 
     # Detect bear markets in S&P 500
     bear_markets = detect_bear_markets(sp500, threshold=0.2)
 
     plot_dual_axis(sp500, [buffet, cape10, ti10y], bear_markets, normalize_right=True)
 
-    sp500, cape10, ti10y = common_date_range(sp500, cape10, ti10y) # filter to common date range
-    earnings_ratio = cape10*ti10y/100.0
-    earnings_ratio.name = "10Y Treasury Yield / S&P Earnings Yield"
+    earnings_ratio = calc_treasury_cape_ratio(averaging_years=10)
     plot_dual_axis(sp500, [earnings_ratio], bear_markets, normalize_right=False)
+
+    excess_cape_yield = calc_excess_cape_yield(averaging_years=10)
+    plot_dual_axis(sp500, [excess_cape_yield], bear_markets, normalize_right=False)
