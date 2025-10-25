@@ -8,11 +8,28 @@ import yfinance as yf
 import numpy as np
 import httpx
 
-# TODO: plot excess cape yield
-# TODO: CPI adjusted treasury yield? Check Shiller's work
-# TODO: add x-axis labels with financial crises (e.g. dot-com bubble in 2000)
 # TODO: ?implement exponential moving average for smoothing inflation
 # TODO: ?add seasonal trends to CPI prediction from historical seasonally adjusted vs non-adjusted data
+
+# Financial crises dictionary with approximate peak/trough dates
+FINANCIAL_CRISES = {
+    "Kennedy Slide of 1962": dt.datetime(1961, 12, 12),
+    "Vietnam war, inflation, FED rates": dt.datetime(1968, 11, 29),
+    "Bretton Woods System end, Oil Crisis": dt.datetime(1973, 1, 11),
+    "Inflation, FED Rates, Oil Crisis": dt.datetime(1980, 11, 28),
+    "Black Monday": dt.datetime(1987, 10, 19),
+    "Dot-com Bubble": dt.datetime(2000, 3, 10),
+    "9/11 Attacks": dt.datetime(2001, 9, 11),
+    "Global Financial Crisis": dt.datetime(2007, 10, 9),
+    "Flash Crash": dt.datetime(2010, 5, 6),
+    "Euro Debt Crisis, Ratings": dt.datetime(2011, 8, 1),
+    "China Slowdown": dt.datetime(2015, 8, 18),
+    "Crude Oil Falling": dt.datetime(2016, 1, 20),
+    "Cryptocurrency Crash": dt.datetime(2018, 9, 20),
+    "COVID-19": dt.datetime(2020, 2, 20),
+    "Inflation, FED Rates, Invasion": dt.datetime(2022, 1, 3),
+    "Trade War": dt.datetime(2025, 4, 3),
+}
 
 # Cache directory for downloaded data
 CACHE_DIR = Path(__file__).parent / "data_cache"
@@ -401,7 +418,7 @@ def common_date_range(*datasets):
         raise ValueError("Datasets do not share a common date range.")
     return [data.loc[(data.index >= common_start) & (data.index <= common_end)] for data in datasets]
 
-def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, normalize_left=False, normalize_right=False) -> None:
+def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, x_axis_labels=None, normalize_left=False, normalize_right=False) -> None:
     """Plot datasets on dual y-axes with optional normalization.
     
     Args:
@@ -411,12 +428,11 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, normalize_lef
         normalize_left: If True, normalize left axis datasets to their maximum
         normalize_right: If True, normalize right axis datasets to their maximum
     """
+    # Create figure and axis
     fig, ax1 = plt.subplots(figsize=(14, 8))
-    
-    # Draw bear market periods
-    if bear_markets:
-        for idx, (start, end) in enumerate(bear_markets):
-            ax1.axvspan(start, end, alpha=0.2, color="gray", label="Bear Markets" if idx == 0 else "")
+    # Convert single datasets to lists
+    left_datasets = left_dataset if isinstance(left_dataset, list) else [left_dataset]
+    right_datasets = right_dataset if isinstance(right_dataset, list) else [right_dataset]
     
     # Normalize function
     def normalize_dataset(data):
@@ -428,10 +444,6 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, normalize_lef
         else:
             # For Series, divide by maximum value
             return data / data.max()
-    
-    # Convert single datasets to lists
-    left_datasets = left_dataset if isinstance(left_dataset, list) else [left_dataset]
-    right_datasets = right_dataset if isinstance(right_dataset, list) else [right_dataset]
     
     # Apply normalization if requested
     if normalize_left:
@@ -491,6 +503,25 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, normalize_lef
     right_ylabel = "Normalized" if normalize_right else (right_labels[0] if len(right_labels) == 1 else "Right Axis")
     ax2.set_ylabel(right_ylabel, color=right_color)
     ax2.tick_params(axis="y", labelcolor=right_color)
+
+    # Draw bear market periods
+    if bear_markets is not None:
+        for idx, (start, end) in enumerate(bear_markets):
+            ax1.axvspan(start, end, alpha=0.2, color="gray", label="Bear Markets" if idx == 0 else "")
+    # Add financial crisis labels to x-axis
+    if x_axis_labels is not None:
+        # Determine the date range of the plot from both left and right datasets
+        plot_start = min(ds.index.min() for ds in left_datasets + right_datasets)
+        # Add vertical lines and labels for each crisis
+        for crisis_name, crisis_date in x_axis_labels.items():
+            # Filter crises that fall within the plot date range
+            if crisis_date < plot_start:
+                continue
+            ax1.axvline(x=crisis_date, color='red', linestyle='--', alpha=0.5, linewidth=0.8)
+            # Add text label rotated vertically
+            ax1.text(crisis_date, ax1.get_ylim()[1] * 0.98, crisis_name, 
+                    rotation=90, verticalalignment='top', horizontalalignment='right',
+                    fontsize=8, alpha=0.7, color='red')
     
     # Set title
     title_left = left_ylabel if len(left_labels) == 1 else f"{len(left_labels)} series"
@@ -507,24 +538,22 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, normalize_lef
     plt.show()
 
 if __name__ == "__main__":
-    # Fetch both datasets
+    # Fetch datasets
     sp500 = fetch_yfinance('^GSPC', auto_adjust=True).rename("S&P 500 Index")
     buffet = calc_buffett_indicator()
     buffet = fit_exponential(buffet, detrend=True, trends=False)
-    cape10 = calc_cape_ratio(averaging_years=10).resample('D').ffill()
-    ti10y = fetch_fred_csv("DGS10").resample('D').ffill().rename("10Y Treasury Yield")
-    print(sp500)
-    print(buffet)
-    print(cape10)
-    print(ti10y)
+    cape10 = calc_cape_ratio(averaging_years=10)
+    ti10y = fetch_fred_csv("DGS10").rename("10Y Treasury Yield")
 
     # Detect bear markets in S&P 500
     bear_markets = detect_bear_markets(sp500, threshold=0.2)
 
-    plot_dual_axis(sp500, [buffet, cape10, ti10y], bear_markets, normalize_right=True)
+    x_axis_labels = FINANCIAL_CRISES
+
+    plot_dual_axis(sp500, [buffet, cape10, ti10y], bear_markets, x_axis_labels=x_axis_labels, normalize_right=True)
 
     earnings_ratio = calc_treasury_cape_ratio(averaging_years=10)
-    plot_dual_axis(sp500, [earnings_ratio], bear_markets, normalize_right=False)
+    plot_dual_axis(sp500, [earnings_ratio], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
 
     excess_cape_yield = calc_excess_cape_yield(averaging_years=10)
-    plot_dual_axis(sp500, [excess_cape_yield], bear_markets, normalize_right=False)
+    plot_dual_axis(sp500, [excess_cape_yield], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
