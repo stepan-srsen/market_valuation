@@ -8,11 +8,14 @@ import yfinance as yf
 import numpy as np
 import httpx
 
+# TODO: implement Price to Sales ratio metric
+# TODO: implement earnings yield gap metric
 # TODO: ?implement exponential moving average for smoothing inflation
 # TODO: ?add seasonal trends to CPI prediction from historical seasonally adjusted vs non-adjusted data
 
 # Financial crises dictionary with approximate peak/trough dates
 FINANCIAL_CRISES = {
+    "Great Depression": dt.datetime(1929, 9, 16),
     "Kennedy Slide of 1962": dt.datetime(1961, 12, 12),
     "Vietnam war, inflation, FED rates": dt.datetime(1968, 11, 29),
     "Bretton Woods System end, Oil Crisis": dt.datetime(1973, 1, 11),
@@ -184,7 +187,7 @@ def fetch_CPI(extrapolate=True, ema_span=12, interpolate=True) -> pd.Series:
         extrapolated_dates = pd.date_range(start=cpi.index[-1] + pd.DateOffset(months=1), periods=extrapolate, freq=pd.DateOffset(months=1))
         # extrapolated_values = [cpi.iloc[-1] * (1 + ema_growth) ** (i + 1) for i in range(extrapolate)]
         extrapolated_values = [cpi.iloc[-1] * (1 + ema_growth) ** (2-2**(-i)) for i in range(extrapolate)] # conservative version
-        # extrapolated_values = [cpi.iloc[-1] * (1 + ema_growth) ** (1-2**(-i-1)) for i in range(extrapolate)] # 2nd conservative version
+        # extrapolated_values = [cpi.iloc[-1] * (1 + ema_growth) ** (1-2**(-i-1)) for i in range(extrapolate)] # ultraconservative version
         # Create series and append
         extrapolated_series = pd.Series(extrapolated_values, index=extrapolated_dates)
         cpi = pd.concat([cpi, extrapolated_series])
@@ -195,12 +198,18 @@ def fetch_CPI(extrapolate=True, ema_span=12, interpolate=True) -> pd.Series:
     cpi = cpi[cpi.index <= pd.Timestamp.now()]
     return cpi.rename("CPI")
 
-def fetch_inflation(averaging_years=10) -> float:
-    """Fetch the inflation rate based on CPI averaged over the last `span` months."""
+def get_CPI_scaling() -> pd.Series:
+    """Get CPI scaling factor (latest CPI / historical CPI) for inflation adjustment."""
+    cpi = fetch_CPI()
+    cpi_scaling = cpi.iloc[-1] / cpi
+    return cpi_scaling.rename("CPI Scaling")
+
+def get_inflation(averaging_years=10) -> float:
+    """Get the annual inflation rate based on CPI averaged over the last `span` months."""
     cpi = fetch_CPI()
     ratio = cpi / cpi.shift(averaging_years*365)
-    ratio_anualized = ratio.dropna() ** (1/averaging_years)
-    inflation = ratio_anualized - 1.0
+    ratio_annualized = ratio.dropna() ** (1/averaging_years)
+    inflation = ratio_annualized - 1.0
     return inflation.rename("Inflation")
 
 def calc_cape_ratio(averaging_years: int = 10) -> pd.Series:
@@ -263,7 +272,7 @@ def calc_excess_cape_yield(averaging_years: int = 10) -> pd.Series:
     """
     cape = calc_cape_ratio(averaging_years=averaging_years).resample('D').ffill()
     ti10y = fetch_fred_csv("DGS10")
-    inflation = fetch_inflation(averaging_years=averaging_years)
+    inflation = get_inflation(averaging_years=averaging_years)
     # Align all series to the same index
     ti10y = ti10y.reindex(cape.index, method='ffill')
     inflation = inflation.reindex(cape.index, method='ffill')
@@ -433,6 +442,9 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, x_axis_labels
     # Convert single datasets to lists
     left_datasets = left_dataset if isinstance(left_dataset, list) else [left_dataset]
     right_datasets = right_dataset if isinstance(right_dataset, list) else [right_dataset]
+
+    plot_start = min(ds.index.min() for ds in left_datasets + right_datasets)
+    plot_end = max(ds.index.max() for ds in left_datasets + right_datasets)
     
     # Normalize function
     def normalize_dataset(data):
@@ -455,7 +467,6 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, x_axis_labels
     left_color = "tab:blue"
     left_colors = plt.cm.Blues(np.linspace(1.0, 0.4, len(left_datasets)))
     ax1.set_xlabel("Date")
-    
     left_labels = []
     for idx, data in enumerate(left_datasets):
         if isinstance(data, pd.DataFrame):
@@ -477,45 +488,52 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, x_axis_labels
     ax1.set_ylabel(left_ylabel, color=left_color)
     ax1.tick_params(axis="y", labelcolor=left_color)
     ax1.grid(True, alpha=0.3)
+    title_left = left_ylabel if len(left_labels) == 1 else f"{len(left_labels)} series"
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    ax1.set_title(f"{title_left}")
 
-    # Plot right axis datasets
-    ax2 = ax1.twinx()
-    right_color = "tab:red"
-    right_colors = plt.cm.Reds(np.linspace(1.0, 0.4, len(right_datasets)))
-    
-    right_labels = []
-    for idx, data in enumerate(right_datasets):
-        if isinstance(data, pd.DataFrame):
-            # Use only the first column's name as the label for the entire DataFrame
-            label = str(data.columns[0])
-            # Plot first column with label, rest without
-            for col_idx, col in enumerate(data.columns):
-                if col_idx == 0:
-                    ax2.plot(data.index, data[col], color=right_colors[idx], alpha=0.7, label=label)
-                else:
-                    ax2.plot(data.index, data[col], color=right_colors[idx], alpha=0.7)
-            right_labels.append(label)
-        else:
-            label = getattr(data, "name", None) or f"Right {idx+1}"
-            data.plot(ax=ax2, color=right_colors[idx], alpha=0.7, label=label, legend=False)
-            right_labels.append(label)
-    
-    right_ylabel = "Normalized" if normalize_right else (right_labels[0] if len(right_labels) == 1 else "Right Axis")
-    ax2.set_ylabel(right_ylabel, color=right_color)
-    ax2.tick_params(axis="y", labelcolor=right_color)
+    lines2, labels2 = [], []
+    if right_datasets:
+        # Plot right axis datasets
+        ax2 = ax1.twinx()
+        right_color = "tab:red"
+        right_colors = plt.cm.Reds(np.linspace(1.0, 0.4, len(right_datasets)))
+        
+        right_labels = []
+        for idx, data in enumerate(right_datasets):
+            if isinstance(data, pd.DataFrame):
+                # Use only the first column's name as the label for the entire DataFrame
+                label = str(data.columns[0])
+                # Plot first column with label, rest without
+                for col_idx, col in enumerate(data.columns):
+                    if col_idx == 0:
+                        ax2.plot(data.index, data[col], color=right_colors[idx], alpha=0.7, label=label)
+                    else:
+                        ax2.plot(data.index, data[col], color=right_colors[idx], alpha=0.7)
+                right_labels.append(label)
+            else:
+                label = getattr(data, "name", None) or f"Right {idx+1}"
+                data.plot(ax=ax2, color=right_colors[idx], alpha=0.7, label=label, legend=False)
+                right_labels.append(label)
+        
+        right_ylabel = "Normalized" if normalize_right else (right_labels[0] if len(right_labels) == 1 else "Right Axis")
+        ax2.set_ylabel(right_ylabel, color=right_color)
+        ax2.tick_params(axis="y", labelcolor=right_color)
+        title_right = right_ylabel if len(right_labels) == 1 else f"{len(right_labels)} series"
+        ax1.set_title(f"{title_left} vs {title_right}")
+        lines2, labels2 = ax2.get_legend_handles_labels()
 
     # Draw bear market periods
     if bear_markets is not None:
         for idx, (start, end) in enumerate(bear_markets):
             ax1.axvspan(start, end, alpha=0.2, color="gray", label="Bear Markets" if idx == 0 else "")
+
     # Add financial crisis labels to x-axis
     if x_axis_labels is not None:
-        # Determine the date range of the plot from both left and right datasets
-        plot_start = min(ds.index.min() for ds in left_datasets + right_datasets)
         # Add vertical lines and labels for each crisis
         for crisis_name, crisis_date in x_axis_labels.items():
             # Filter crises that fall within the plot date range
-            if crisis_date < plot_start:
+            if crisis_date < plot_start or crisis_date > plot_end:
                 continue
             ax1.axvline(x=crisis_date, color='red', linestyle='--', alpha=0.5, linewidth=0.8)
             # Add text label rotated vertically
@@ -523,23 +541,19 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, x_axis_labels
                     rotation=90, verticalalignment='top', horizontalalignment='right',
                     fontsize=8, alpha=0.7, color='red')
     
-    # Set title
-    title_left = left_ylabel if len(left_labels) == 1 else f"{len(left_labels)} series"
-    title_right = right_ylabel if len(right_labels) == 1 else f"{len(right_labels)} series"
-    ax1.set_title(f"{title_left} vs {title_right}")
-    
+    # Set x limits
+    ax1.set_xlim(plot_start, plot_end)
     # Combine legends
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
     if lines1 or lines2:
         ax1.legend(lines1 + lines2, labels1 + labels2)
-    
     plt.tight_layout()
     plt.show()
 
 if __name__ == "__main__":
+    plt.ion()
     # Fetch datasets
-    sp500 = fetch_yfinance('^GSPC', auto_adjust=True).rename("S&P 500 Index")
+    cpi_scaling = get_CPI_scaling()
+    sp500 = fetch_yfinance('^GSPC').resample("D").ffill().rename("S&P 500 Index")
     buffet = calc_buffett_indicator()
     buffet = fit_exponential(buffet, detrend=True, trends=False)
     cape10 = calc_cape_ratio(averaging_years=10)
@@ -550,6 +564,10 @@ if __name__ == "__main__":
 
     x_axis_labels = FINANCIAL_CRISES
 
+    sp500_1975 = (sp500[sp500.index > dt.datetime(1975, 1, 1)]*cpi_scaling).dropna().rename("S&P 500 Index (CPI-Adjusted)")
+    bear_markets_1975 = detect_bear_markets(sp500_1975, threshold=0.2)
+    plot_dual_axis(fit_exponential(sp500_1975, detrend=True, trends=True), [], bear_markets_1975, x_axis_labels=x_axis_labels, normalize_right=True)
+
     plot_dual_axis(sp500, [buffet, cape10, ti10y], bear_markets, x_axis_labels=x_axis_labels, normalize_right=True)
 
     earnings_ratio = calc_treasury_cape_ratio(averaging_years=10)
@@ -557,3 +575,4 @@ if __name__ == "__main__":
 
     excess_cape_yield = calc_excess_cape_yield(averaging_years=10)
     plot_dual_axis(sp500, [excess_cape_yield], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
+    plt.show(block=True)
