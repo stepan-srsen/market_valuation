@@ -357,6 +357,27 @@ def detect_bear_markets(series: pd.Series, threshold: float = 0.20) -> list:
 
     return bear_periods
 
+def add_bands(series: pd.Series, std_devs: list = [1, 2]) -> pd.DataFrame:
+    """Add standard deviation bands to a time series.
+    
+    Args:
+        series: Time series to add bands to
+        std_devs: List of standard deviation multiples to add bands for
+        
+    Returns:
+        DataFrame with original series and std dev bands
+    """
+    mean = series.mean()
+    std_dev = np.std(series)
+    bands = [series]
+    bands.append(pd.Series(mean, index=series.index, name=f"{series.name} fit"))
+    for n in std_devs:
+        bands.append(pd.Series(mean + n * std_dev, index=series.index, name=f"{series.name} +{n} SD"))
+        bands.append(pd.Series(mean - n * std_dev, index=series.index, name=f"{series.name} -{n} SD"))
+    result = pd.concat(bands, axis=1)
+    
+    return result
+
 def fit_exponential(series: pd.Series, detrend: bool = False, trends: bool = True) -> pd.DataFrame:
     """Fit an exponential trend to a time series and return with confidence bands.
     
@@ -381,29 +402,17 @@ def fit_exponential(series: pd.Series, detrend: bool = False, trends: bool = Tru
     y_fit = np.exp(log_a + b * x)
     
     # Detrend the data first
-    detrended_y = y / y_fit
-    
-    # Calculate residuals and standard deviation from detrended data
-    residuals = detrended_y - 1.0  # Mean of detrended data is 1.0
-    std_dev = np.std(residuals)
-    
+    detrended_y = series / y_fit
+       
     if detrend:
-        series = pd.Series(detrended_y, index=series.index, name=f"{series.name} (detrended)")
+        detrended_y.name = f"{series.name} (exp detrended)"
         if not trends:
-            return series
-        base_trend = pd.Series(np.ones_like(y_fit), index=series.index, name=f"{series.name} exp fit")
+            return detrended_y
+        return add_bands(detrended_y)
     else:
         if not trends:
             return series
-        base_trend = pd.Series(y_fit, index=series.index, name=f"{series.name} exp fit")
-    bands = [series, base_trend]
-    std_devs = [1, 2]
-    for n in std_devs:
-        bands.append(pd.Series(base_trend * (1 + n * std_dev), index=series.index, name=f"{series.name} exp +{n} SD"))
-        bands.append(pd.Series(base_trend * (1 - n * std_dev), index=series.index, name=f"{series.name} exp -{n} SD"))
-    result = pd.concat(bands, axis=1)
-    
-    return result
+        return add_bands(detrended_y).mul(y_fit, axis=0)
 
 def common_date_range(*datasets):
     """Return copies of datasets limited to their shared date range."""
@@ -427,23 +436,31 @@ def common_date_range(*datasets):
         raise ValueError("Datasets do not share a common date range.")
     return [data.loc[(data.index >= common_start) & (data.index <= common_end)] for data in datasets]
 
-def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, x_axis_labels=None, normalize_left=False, normalize_right=False) -> None:
+def plot_dual_axis(left_datasets, right_datasets=[], bear_markets=None, x_axis_labels=None, normalize_left=False, normalize_right=False, from_maxmin=True) -> None:
     """Plot datasets on dual y-axes with optional normalization.
     
     Args:
-        left_dataset: Single Series/DataFrame or list of Series/DataFrames for left axis
-        right_dataset: Single Series/DataFrame or list of Series/DataFrames for right axis
+        left_datasets: Single Series/DataFrame or list of Series/DataFrames for left axis
+        right_datasets: Single Series/DataFrame or list of Series/DataFrames for right axis
         bear_markets: List of (start, end) tuples for bear market periods
+        x_axis_labels: Dictionary of {label: date} for significant events on x-axis
         normalize_left: If True, normalize left axis datasets to their maximum
         normalize_right: If True, normalize right axis datasets to their maximum
+        from_maxmin: If True, set plot start date to max of left/right min dates; else min of left/right min dates
     """
     # Create figure and axis
     fig, ax1 = plt.subplots(figsize=(14, 8))
     # Convert single datasets to lists
-    left_datasets = left_dataset if isinstance(left_dataset, list) else [left_dataset]
-    right_datasets = right_dataset if isinstance(right_dataset, list) else [right_dataset]
+    left_datasets = left_datasets if isinstance(left_datasets, list) else [left_datasets]
+    right_datasets = right_datasets if isinstance(right_datasets, list) else [right_datasets]
 
-    plot_start = min(ds.index.min() for ds in left_datasets + right_datasets)
+    plot_start = min(ds.index.min() for ds in left_datasets)
+    if right_datasets:
+        right_min = min(ds.index.min() for ds in right_datasets)
+        if from_maxmin:
+            plot_start = max(plot_start, right_min)
+        else:
+            plot_start = min(plot_start, right_min)
     plot_end = max(ds.index.max() for ds in left_datasets + right_datasets)
     
     # Normalize function
@@ -465,7 +482,7 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, x_axis_labels
     
     # Plot left axis datasets
     left_color = "tab:blue"
-    left_colors = plt.cm.Blues(np.linspace(1.0, 0.4, len(left_datasets)))
+    left_colors = plt.cm.Blues(np.linspace(1.0, 0.35, len(left_datasets)))
     ax1.set_xlabel("Date")
     left_labels = []
     for idx, data in enumerate(left_datasets):
@@ -477,7 +494,7 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, x_axis_labels
                 if col_idx == 0:
                     ax1.plot(data.index, data[col], color=left_colors[idx], label=label)
                 else:
-                    ax1.plot(data.index, data[col], color=left_colors[idx])
+                    ax1.plot(data.index, data[col], color=left_colors[idx], linestyle='--')
             left_labels.append(label)
         else:
             label = getattr(data, "name", None) or f"Left {idx+1}"
@@ -489,16 +506,14 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, x_axis_labels
     ax1.tick_params(axis="y", labelcolor=left_color)
     ax1.grid(True, alpha=0.3)
     title_left = left_ylabel if len(left_labels) == 1 else f"{len(left_labels)} series"
-    lines1, labels1 = ax1.get_legend_handles_labels()
     ax1.set_title(f"{title_left}")
 
     lines2, labels2 = [], []
     if right_datasets:
         # Plot right axis datasets
         ax2 = ax1.twinx()
-        right_color = "tab:red"
-        right_colors = plt.cm.Reds(np.linspace(1.0, 0.4, len(right_datasets)))
-        
+        right_color = "tab:orange"
+        right_colors = plt.cm.Oranges(np.linspace(1.0, 0.35, len(right_datasets)))
         right_labels = []
         for idx, data in enumerate(right_datasets):
             if isinstance(data, pd.DataFrame):
@@ -509,7 +524,7 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, x_axis_labels
                     if col_idx == 0:
                         ax2.plot(data.index, data[col], color=right_colors[idx], alpha=0.7, label=label)
                     else:
-                        ax2.plot(data.index, data[col], color=right_colors[idx], alpha=0.7)
+                        ax2.plot(data.index, data[col], color=right_colors[idx], alpha=0.7, linestyle='--')
                 right_labels.append(label)
             else:
                 label = getattr(data, "name", None) or f"Right {idx+1}"
@@ -526,20 +541,22 @@ def plot_dual_axis(left_dataset, right_dataset, bear_markets=None, x_axis_labels
     # Draw bear market periods
     if bear_markets is not None:
         for idx, (start, end) in enumerate(bear_markets):
-            ax1.axvspan(start, end, alpha=0.2, color="gray", label="Bear Markets" if idx == 0 else "")
+            ax1.axvspan(start, end, alpha=0.1, color="black", label="Bear Markets" if idx == 0 else "")
 
-    # Add financial crisis labels to x-axis
+    lines1, labels1 = ax1.get_legend_handles_labels()
+
+    # Add significant labels to x-axis
     if x_axis_labels is not None:
-        # Add vertical lines and labels for each crisis
-        for crisis_name, crisis_date in x_axis_labels.items():
-            # Filter crises that fall within the plot date range
-            if crisis_date < plot_start or crisis_date > plot_end:
+        # Add vertical lines and labels for each label
+        for label_name, label_date in x_axis_labels.items():
+            # Filter labels that fall within the plot date range
+            if label_date < plot_start or label_date > plot_end:
                 continue
-            ax1.axvline(x=crisis_date, color='red', linestyle='--', alpha=0.5, linewidth=0.8)
+            ax1.axvline(x=label_date, color='red', linestyle='--', alpha=0.5, linewidth=0.8)
             # Add text label rotated vertically
-            ax1.text(crisis_date, ax1.get_ylim()[1] * 0.98, crisis_name, 
+            ax1.text(label_date, ax1.get_ylim()[1] * 0.98, label_name, 
                     rotation=90, verticalalignment='top', horizontalalignment='right',
-                    fontsize=8, alpha=0.7, color='red')
+                    fontsize=8, alpha=0.8, color='red')
     
     # Set x limits
     ax1.set_xlim(plot_start, plot_end)
@@ -571,8 +588,10 @@ if __name__ == "__main__":
     plot_dual_axis(sp500, [buffet, cape10, ti10y], bear_markets, x_axis_labels=x_axis_labels, normalize_right=True)
 
     earnings_ratio = calc_treasury_cape_ratio(averaging_years=10)
+    earnings_ratio = add_bands(earnings_ratio)
     plot_dual_axis(sp500, [earnings_ratio], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
 
     excess_cape_yield = calc_excess_cape_yield(averaging_years=10)
+    excess_cape_yield = add_bands(excess_cape_yield)
     plot_dual_axis(sp500, [excess_cape_yield], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
     plt.show(block=True)
