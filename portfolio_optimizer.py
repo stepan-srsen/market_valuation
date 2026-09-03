@@ -1,22 +1,34 @@
-"""Portfolio optimizer: maximize the Sharpe ratio across MSCI World factor indices, gold and silver.
+"""Portfolio optimizer: maximize the Sharpe ratio across MSCI World factor indices, gold, silver and Nasdaq 100.
 
 Loads historical monthly prices for:
   - MSCI World, MSCI World Value, MSCI World Momentum, MSCI World Energy, MSCI World High Dividend Yield (xlsx)
-  - Gold spot price, Silver spot price (csv)
+  - Gold futures, Silver futures, Nasdaq 100 index (yfinance, cached locally)
 
 Aligns all series to their maximum common date range, finds the long-only weights that
 maximize the Sharpe ratio (mean-variance optimization), and reports performance,
 volatility, Sharpe ratio and maximum drawdown for the optimal portfolio and its constituents.
 """
+import datetime as dt
 import glob
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import yfinance as yf
 from scipy.optimize import minimize
 
 DATA_DIR = Path(__file__).parent / "data"
+CACHE_DIR = Path(__file__).parent / "data_cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+# yfinance tickers loaded alongside the MSCI factor indices, as (ticker, series name) pairs.
+YFINANCE_TICKERS = [
+    ("GC=F", "Gold"),
+    # ("SI=F", "Silver"),
+    # ("^NDX", "Nasdaq 100"),
+    # ("^GSPC", "S&P 500"),
+]
 
 # Annualized risk-free rate assumption used in the Sharpe ratio calculation.
 RISK_FREE_RATE = 0.0
@@ -45,13 +57,32 @@ def load_msci_index(path: Path) -> pd.Series:
     return series
 
 
-def load_metal_price(path: Path, name: str) -> pd.Series:
-    """Load a monthly metal spot price csv (MM/YYYY dates) and return a Series indexed by month Period."""
-    df = pd.read_csv(path)
-    price_col = df.columns[1]
-    period = pd.to_datetime(df["Date"], format="%m/%Y").dt.to_period("M")
-    series = pd.Series(df[price_col].values, index=period, name=name)
-    return series
+def fetch_yfinance_monthly(ticker: str, name: str) -> pd.Series:
+    """Download daily closes for ticker via yfinance (cached locally, refreshed once per day) and return monthly closes."""
+    cache_path = CACHE_DIR / f"{ticker.replace('^', '').replace('=', '_')}.pkl"
+
+    should_download = True
+    if cache_path.exists():
+        file_mod_time = dt.datetime.fromtimestamp(cache_path.stat().st_mtime)
+        if file_mod_time.date() == dt.datetime.now().date():
+            should_download = False
+
+    if should_download:
+        data = yf.download(ticker, auto_adjust=True, period="max", interval="1d")
+        if data.empty:
+            raise ValueError(f"No data returned for {ticker}.")
+        data.to_pickle(cache_path)
+    else:
+        data = pd.read_pickle(cache_path)
+
+    if isinstance(data.columns, pd.MultiIndex):
+        closes = data["Close"][ticker].dropna()
+    else:
+        closes = data["Close"].dropna()
+
+    monthly = closes.groupby(closes.index.to_period("M")).last()
+    monthly.name = name
+    return monthly
 
 
 def load_excess_cape_yield(path: Path = DATA_DIR / "ie_data.xls") -> pd.Series:
@@ -66,9 +97,8 @@ def load_excess_cape_yield(path: Path = DATA_DIR / "ie_data.xls") -> pd.Series:
 
 def load_all_prices() -> pd.DataFrame:
     """Load all constituent price series and align them to their maximum common date range."""
-    series = [load_msci_index(p) for p in sorted(glob.glob(str(DATA_DIR / "*.xlsx")))]
-    series.append(load_metal_price(DATA_DIR / "gold.csv", "Gold"))
-    series.append(load_metal_price(DATA_DIR / "silver.csv", "Silver"))
+    series = [load_msci_index(p) for p in sorted(glob.glob(str(CACHE_DIR / "*MSCI*.xlsx")))]
+    series.extend(fetch_yfinance_monthly(ticker, name) for ticker, name in YFINANCE_TICKERS)
 
     prices = pd.concat(series, axis=1).sort_index()
     prices = prices.dropna(how="any")  # keep only the maximum common date range
