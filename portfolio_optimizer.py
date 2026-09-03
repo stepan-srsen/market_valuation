@@ -31,6 +31,8 @@ DEFAULT_QUANTILES = (1/3, 2/3)
 BOOTSTRAP_BLOCK_SIZE = 12
 BOOTSTRAP_ITERATIONS = 1000
 BOOTSTRAP_CI_LEVEL = 0.90
+# Fewer iterations for the quantile-count scan, which reruns the bootstrap once per quantile count.
+BOOTSTRAP_SCAN_ITERATIONS = 200
 
 def load_msci_index(path: Path) -> pd.Series:
     """Load a monthly MSCI index export (xlsx) and return a Series indexed by month Period."""
@@ -323,30 +325,65 @@ def format_ci_table(ci: pd.DataFrame) -> pd.DataFrame:
     return formatted
 
 
-def scan_quantile_counts(returns: pd.DataFrame, ecy: pd.Series, max_quantiles: int = 9) -> pd.DataFrame:
+def format_quantile_scan(scan: pd.DataFrame) -> pd.DataFrame:
+    """Format a quantile-scan DataFrame with MultiIndex (metric, stat) columns for printing."""
+    formatted = scan.copy()
+    for metric in formatted.columns.get_level_values(0).unique():
+        fmt = (lambda v: f"{v:.2f}") if metric == "Sharpe Ratio" else (lambda v: f"{v:.2%}")
+        for stat in formatted[metric].columns:
+            formatted[(metric, stat)] = formatted[(metric, stat)].map(fmt)
+    return formatted
+
+
+def scan_quantile_counts(
+    returns: pd.DataFrame,
+    ecy: pd.Series,
+    max_quantiles: int = 9,
+    n_iterations: int = BOOTSTRAP_SCAN_ITERATIONS,
+    block_size: int = BOOTSTRAP_BLOCK_SIZE,
+    ci_level: float = BOOTSTRAP_CI_LEVEL,
+) -> pd.DataFrame:
     """Scan 1 to max_quantiles equidistant quantile cut points (2 to max_quantiles+1 buckets).
 
-    Returns a DataFrame indexed by number of quantiles, with the Regime-Switching Portfolio's
-    performance summary for each configuration.
+    Returns a DataFrame indexed by number of quantiles, with MultiIndex columns (metric, stat)
+    where stat is one of "Estimate", "CI Lower", "CI Upper" from a block bootstrap re-run at
+    each quantile count (each resample re-derives its own Excess CAPE Yield buckets).
     """
+    rng = np.random.default_rng()
     rows = {}
     for n_quantiles in range(1, max_quantiles + 1):
         quantiles = tuple(i / (n_quantiles + 1) for i in range(1, n_quantiles + 1))
         portfolio_returns = regime_switching_returns(returns, ecy, quantiles)
-        rows[n_quantiles] = performance_summary(portfolio_returns.to_frame()).iloc[0]
+        estimate = performance_summary(portfolio_returns.to_frame()).iloc[0]
+
+        metrics_rows = []
+        for _ in range(n_iterations):
+            resampled_returns, resampled_ecy = block_bootstrap_resample(returns, ecy, block_size, rng)
+            try:
+                resampled_portfolio_returns = regime_switching_returns(resampled_returns, resampled_ecy, quantiles)
+            except RuntimeError:
+                continue
+            metrics_rows.append(performance_summary(resampled_portfolio_returns.to_frame()).iloc[0])
+        ci = summarize_bootstrap_ci(estimate, pd.DataFrame(metrics_rows), ci_level)
+        rows[n_quantiles] = ci.stack()
     scan = pd.DataFrame(rows).T
     scan.index.name = "Quantiles"
     return scan
 
 
-def plot_quantile_scan(scan: pd.DataFrame) -> None:
-    """Plot the Regime-Switching Portfolio's Sharpe ratio against the number of equidistant quantiles."""
+def plot_quantile_scan(scan: pd.DataFrame, ci_level: float = BOOTSTRAP_CI_LEVEL) -> None:
+    """Plot the Regime-Switching Portfolio's Sharpe ratio, with its bootstrap CI band, vs quantile count."""
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(scan.index, scan["Sharpe Ratio"], marker="o")
+    ax.fill_between(
+        scan.index, scan[("Sharpe Ratio", "CI Lower")], scan[("Sharpe Ratio", "CI Upper")],
+        alpha=0.2, label=f"{ci_level:.0%} bootstrap CI",
+    )
+    ax.plot(scan.index, scan[("Sharpe Ratio", "Estimate")], marker="o", label="Sharpe Ratio")
     ax.set_xlabel("Number of Equidistant Quantiles")
     ax.set_ylabel("Sharpe Ratio")
     ax.set_title("Regime-Switching Portfolio Sharpe Ratio vs Number of Quantiles")
     ax.grid(True, alpha=0.3)
+    ax.legend()
     plt.tight_layout()
     plt.show()
 
@@ -468,7 +505,7 @@ def main() -> None:
 
     scan = scan_quantile_counts(returns, ecy, max_quantiles=5)
     print("\n=== Regime-Switching Portfolio: scanning 1-5 equidistant quantiles ===")
-    print(format_summary(scan).to_string())
+    print(format_quantile_scan(scan).to_string())
     plot_quantile_scan(scan)
 
 
