@@ -10,6 +10,7 @@ volatility, Sharpe ratio and maximum drawdown for the optimal portfolio and its 
 """
 import datetime as dt
 import glob
+from collections.abc import Callable
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -46,8 +47,8 @@ RISK_FREE_RATE = 0.0
 MONTHS_PER_YEAR = 12
 
 # Quantiles of the excess CAPE yield used to split history into valuation regimes.
-#DEFAULT_QUANTILES = [1/2]
-DEFAULT_QUANTILES = (1/3, 2/3)
+DEFAULT_QUANTILES = [1/2]
+#DEFAULT_QUANTILES = (1/3, 2/3)
 # DEFAULT_QUANTILES = (1/4, 2/4, 3/4)
 #DEFAULT_QUANTILES = (1/5, 2/5, 3/5, 4/5)
 
@@ -156,6 +157,61 @@ def optimize_sharpe(returns: pd.DataFrame) -> pd.Series:
     return pd.Series(result.x, index=returns.columns, name="Weight")
 
 
+def optimize_linear_weights(returns: pd.DataFrame, x: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Fit each asset weight as w_i(t) = a_i + b_i * x(t), long-only and summing to 1 in every
+    month of the sample, maximizing the annualized Sharpe ratio of the resulting portfolio.
+
+    Returns (intercepts, slopes), each a Series indexed by asset.
+    """
+    assets = returns.columns
+    n = len(assets)
+    x_values = x.to_numpy()
+    r_values = returns.to_numpy()
+
+    def weights_matrix(params: np.ndarray) -> np.ndarray:
+        a, b = params[:n], params[n:]
+        return a[None, :] + b[None, :] * x_values[:, None]  # shape (T, n)
+
+    def neg_sharpe(params: np.ndarray) -> float:
+        port_returns = (weights_matrix(params) * r_values).sum(axis=1)
+        mean_ann = port_returns.mean() * MONTHS_PER_YEAR
+        vol_ann = port_returns.std() * np.sqrt(MONTHS_PER_YEAR)
+        return -(mean_ann - RISK_FREE_RATE) / vol_ann
+
+    init_guess = np.concatenate([np.repeat(1.0 / n, n), np.zeros(n)])
+    constraints = (
+        {"type": "eq", "fun": lambda p: np.sum(p[:n]) - 1.0},
+        {"type": "eq", "fun": lambda p: np.sum(p[n:])},
+        {"type": "ineq", "fun": lambda p: weights_matrix(p).reshape(-1)},  # w(t) >= 0 every month
+        {"type": "ineq", "fun": lambda p: 1.0 - weights_matrix(p).reshape(-1)},  # w(t) <= 1 every month
+    )
+
+    result = minimize(neg_sharpe, init_guess, method="SLSQP", constraints=constraints, options={"maxiter": 1000})
+    if not result.success:
+        raise RuntimeError(f"Linear weight optimization failed: {result.message}")
+    a = pd.Series(result.x[:n], index=assets, name="Intercept")
+    b = pd.Series(result.x[n:], index=assets, name="Slope")
+    return a, b
+
+
+def linear_weights_matrix(a: pd.Series, b: pd.Series, x: pd.Series) -> pd.DataFrame:
+    """Weights w_i(t) = a_i + b_i * x(t), clipped to [0, 1] and renormalized to sum to 1 per month.
+
+    Clipping is a no-op for the in-sample x the coefficients were fit on (already within bounds by
+    construction) and acts as a safety net when applying fixed coefficients to out-of-sample x, e.g.
+    a bootstrap resample.
+    """
+    raw = pd.DataFrame(x.to_numpy()[:, None] * b.to_numpy()[None, :] + a.to_numpy()[None, :], index=x.index, columns=a.index)
+    clipped = raw.clip(lower=0.0, upper=1.0)
+    return clipped.div(clipped.sum(axis=1), axis=0)
+
+
+def linear_portfolio_returns(returns: pd.DataFrame, a: pd.Series, b: pd.Series, x: pd.Series) -> pd.Series:
+    """Portfolio returns from applying the linear weight function w_i(t) = a_i + b_i*x(t)."""
+    weights = linear_weights_matrix(a, b, x)
+    return (returns * weights).sum(axis=1)
+
+
 def max_drawdown(cumulative: pd.Series) -> float:
     """Maximum drawdown of a cumulative price/growth series."""
     running_max = cumulative.cummax()
@@ -214,6 +270,29 @@ def analyze_and_report(returns: pd.DataFrame, title: str) -> tuple[pd.Series, pd
     print(format_summary(summary).to_string())
 
     return weights, portfolio_returns
+
+
+def analyze_and_report_linear(returns: pd.DataFrame, x: pd.Series, title: str) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Fit linear weights w_i(t) = a_i + b_i*x(t) maximizing Sharpe, print coefficients and performance.
+
+    Returns (intercepts, slopes, portfolio_returns) so callers can reuse the fit elsewhere.
+    """
+    a, b = optimize_linear_weights(returns, x)
+    portfolio_returns = linear_portfolio_returns(returns, a, b, x)
+    portfolio_returns.name = "Optimal Portfolio"
+
+    all_returns = returns.copy()
+    all_returns[portfolio_returns.name] = portfolio_returns
+    summary = performance_summary(all_returns)
+
+    print(f"\n=== {title} ({len(returns)} months) ===")
+    print("Linear weight coefficients (Weight = Intercept + Slope * x):")
+    print(pd.DataFrame({"Intercept": a, "Slope": b}).map(lambda v: f"{v:.4f}").to_string())
+    print()
+    print("Performance summary:")
+    print(format_summary(summary).to_string())
+
+    return a, b, portfolio_returns
 
 
 def format_interval(interval: pd.Interval) -> str:
@@ -288,41 +367,62 @@ def run_block_bootstrap(
     ecy: pd.Series,
     full_weights: pd.Series,
     bucket_weights: list[pd.Series],
+    ecy_value_coeffs: tuple[pd.Series, pd.Series],
+    ecy_percentile_coeffs: tuple[pd.Series, pd.Series],
     quantiles=DEFAULT_QUANTILES,
     n_iterations: int = BOOTSTRAP_ITERATIONS,
     block_size: int = BOOTSTRAP_BLOCK_SIZE,
 ) -> dict:
-    """Run a circular block bootstrap that evaluates the already-optimized Full-Period and
-    Regime-Switching portfolios (fixed weights) against resampled return paths; only the
-    Excess-CAPE-Yield bucket membership is re-derived per resample, not the weights themselves.
+    """Run a circular block bootstrap that evaluates the already-optimized Full-Period,
+    Regime-Switching and linear-weight (in ECY value / ECY percentile) portfolios (all fixed
+    weights/coefficients) against resampled return paths. Only the Excess-CAPE-Yield bucket
+    membership (Regime-Switching) and percentile rank (linear-in-percentile) are re-derived per
+    resample, not the weights/coefficients themselves.
 
-    Returns a dict with "full_metrics" and "regime_metrics" (one row per bootstrap iteration),
-    plus "full_growth" and "regime_growth" arrays (one resampled cumulative growth path per row,
-    same column order as `returns`) used to band the growth plots.
+    Returns a dict with "<key>_metrics" (one row per bootstrap iteration) and "<key>_growth"
+    (one resampled cumulative growth path per row, same column order as `returns`) for each of
+    "full", "regime", "ecy_value" and "ecy_percentile".
     """
     rng = np.random.default_rng()
+    ecy_value_a, ecy_value_b = ecy_value_coeffs
+    ecy_percentile_a, ecy_percentile_b = ecy_percentile_coeffs
 
-    full_metrics_rows = []
-    full_growth_rows = []
-    regime_metrics_rows = []
-    regime_growth_rows = []
+    rows: dict[str, list] = {
+        "full_metrics": [], "full_growth": [],
+        "regime_metrics": [], "regime_growth": [],
+        "ecy_value_metrics": [], "ecy_value_growth": [],
+        "ecy_percentile_metrics": [], "ecy_percentile_growth": [],
+    }
 
     for _ in range(n_iterations):
         resampled_returns, resampled_ecy = block_bootstrap_resample(returns, ecy, block_size, rng)
 
         full_portfolio_returns = resampled_returns @ full_weights
-        full_metrics_rows.append(performance_summary(full_portfolio_returns.to_frame(name="Optimal Portfolio")).iloc[0])
-        full_growth_rows.append((1.0 + full_portfolio_returns).cumprod().to_numpy())
+        rows["full_metrics"].append(performance_summary(full_portfolio_returns.to_frame(name="Optimal Portfolio")).iloc[0])
+        rows["full_growth"].append((1.0 + full_portfolio_returns).cumprod().to_numpy())
 
         regime_returns = evaluate_regime_switching(resampled_returns, resampled_ecy, quantiles, bucket_weights)
-        regime_metrics_rows.append(performance_summary(regime_returns.to_frame()).iloc[0])
-        regime_growth_rows.append((1.0 + regime_returns).cumprod().to_numpy())
+        rows["regime_metrics"].append(performance_summary(regime_returns.to_frame()).iloc[0])
+        rows["regime_growth"].append((1.0 + regime_returns).cumprod().to_numpy())
+
+        ecy_value_returns = linear_portfolio_returns(resampled_returns, ecy_value_a, ecy_value_b, resampled_ecy)
+        rows["ecy_value_metrics"].append(performance_summary(ecy_value_returns.to_frame(name="Optimal Portfolio")).iloc[0])
+        rows["ecy_value_growth"].append((1.0 + ecy_value_returns).cumprod().to_numpy())
+
+        resampled_percentile = resampled_ecy.rank(pct=True)
+        ecy_percentile_returns = linear_portfolio_returns(resampled_returns, ecy_percentile_a, ecy_percentile_b, resampled_percentile)
+        rows["ecy_percentile_metrics"].append(performance_summary(ecy_percentile_returns.to_frame(name="Optimal Portfolio")).iloc[0])
+        rows["ecy_percentile_growth"].append((1.0 + ecy_percentile_returns).cumprod().to_numpy())
 
     return {
-        "full_metrics": pd.DataFrame(full_metrics_rows),
-        "full_growth": np.array(full_growth_rows),
-        "regime_metrics": pd.DataFrame(regime_metrics_rows),
-        "regime_growth": np.array(regime_growth_rows),
+        "full_metrics": pd.DataFrame(rows["full_metrics"]),
+        "full_growth": np.array(rows["full_growth"]),
+        "regime_metrics": pd.DataFrame(rows["regime_metrics"]),
+        "regime_growth": np.array(rows["regime_growth"]),
+        "ecy_value_metrics": pd.DataFrame(rows["ecy_value_metrics"]),
+        "ecy_value_growth": np.array(rows["ecy_value_growth"]),
+        "ecy_percentile_metrics": pd.DataFrame(rows["ecy_percentile_metrics"]),
+        "ecy_percentile_growth": np.array(rows["ecy_percentile_growth"]),
     }
 
 
@@ -416,6 +516,32 @@ def plot_quantile_scan(scan: pd.DataFrame, ci_level: float = BOOTSTRAP_CI_LEVEL)
     plt.show()
 
 
+def plot_linear_weights(
+    a: pd.Series, b: pd.Series, x: pd.Series, xlabel: str, title: str,
+    x_axis_map: Callable[[np.ndarray], np.ndarray] | None = None,
+) -> None:
+    """Plot each asset's linear weight function w_i(x) = a_i + b_i*x (clipped/renormalized) over the observed range of x.
+
+    x_axis_map, if given, maps the linspace grid of x (e.g. an Excess CAPE Yield percentile) to the
+    values shown on the x-axis (e.g. actual Excess CAPE Yield via its empirical quantile function),
+    producing a nonlinear curve when displayed against a variable other than the one w is linear in.
+    """
+    x_grid = np.linspace(x.min(), x.max(), 200)
+    weights = linear_weights_matrix(a, b, pd.Series(x_grid))
+    x_axis = x_axis_map(x_grid) if x_axis_map is not None else x_grid
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for col in weights.columns:
+        ax.plot(x_axis, weights[col], label=col)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Weight")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_normalized(
     prices: pd.DataFrame,
     portfolio_growth: pd.Series,
@@ -503,10 +629,35 @@ def main() -> None:
 
     regime_growth = (1.0 + regime_returns).cumprod()
 
+    ecy_percentile = ecy.rank(pct=True)
+    ecy_value_a, ecy_value_b, ecy_value_returns = analyze_and_report_linear(
+        returns, ecy, "Linear Weights (Excess CAPE Yield)")
+    ecy_value_returns.name = "Linear Weights (ECY)"
+    ecy_value_metrics = performance_summary(ecy_value_returns.to_frame()).iloc[0]
+    ecy_value_growth = (1.0 + ecy_value_returns).cumprod()
+    plot_linear_weights(
+        ecy_value_a, ecy_value_b, ecy,
+        xlabel="Excess CAPE Yield (%)", title="Portfolio Weights vs Excess CAPE Yield",
+    )
+
+    ecy_percentile_a, ecy_percentile_b, ecy_percentile_returns = analyze_and_report_linear(
+        returns, ecy_percentile, "Linear Weights (Excess CAPE Yield Percentile)")
+    ecy_percentile_returns.name = "Linear Weights (ECY Percentile)"
+    ecy_percentile_metrics = performance_summary(ecy_percentile_returns.to_frame()).iloc[0]
+    ecy_percentile_growth = (1.0 + ecy_percentile_returns).cumprod()
+    plot_linear_weights(
+        ecy_percentile_a, ecy_percentile_b, ecy_percentile,
+        xlabel="Excess CAPE Yield (%)", title="Portfolio Weights vs Excess CAPE Yield Percentile",
+        x_axis_map=lambda grid: ecy.quantile(grid).to_numpy(),
+    )
+
     print(f"\n=== Block Bootstrap Confidence Intervals "
           f"(block size={BOOTSTRAP_BLOCK_SIZE} months, {BOOTSTRAP_ITERATIONS} iterations, "
           f"{BOOTSTRAP_CI_LEVEL:.0%} CI) ===")
-    bootstrap = run_block_bootstrap(returns, ecy, full_weights, bucket_weights_list, DEFAULT_QUANTILES)
+    bootstrap = run_block_bootstrap(
+        returns, ecy, full_weights, bucket_weights_list,
+        (ecy_value_a, ecy_value_b), (ecy_percentile_a, ecy_percentile_b), DEFAULT_QUANTILES,
+    )
 
     full_growth_ci = growth_ci_band(bootstrap["full_growth"], returns.index)
     plot_normalized(prices, portfolio_growth, ci_band=full_growth_ci)
@@ -517,11 +668,30 @@ def main() -> None:
         ci_band=regime_growth_ci,
     )
 
+    ecy_value_growth_ci = growth_ci_band(bootstrap["ecy_value_growth"], returns.index)
+    plot_normalized(
+        prices, ecy_value_growth, title="Normalized Performance \u2014 Linear Weights (Excess CAPE Yield, start = 100)",
+        ci_band=ecy_value_growth_ci,
+    )
+
+    ecy_percentile_growth_ci = growth_ci_band(bootstrap["ecy_percentile_growth"], returns.index)
+    plot_normalized(
+        prices, ecy_percentile_growth,
+        title="Normalized Performance \u2014 Linear Weights (Excess CAPE Yield Percentile, start = 100)",
+        ci_band=ecy_percentile_growth_ci,
+    )
+
     print("\nFull-Period Optimal Portfolio performance:")
     print(format_ci_table(summarize_bootstrap_ci(full_metrics, bootstrap["full_metrics"])).to_string())
 
     print("\nRegime-Switching Portfolio performance:")
     print(format_ci_table(summarize_bootstrap_ci(regime_metrics, bootstrap["regime_metrics"])).to_string())
+
+    print("\nLinear Weights (Excess CAPE Yield) performance:")
+    print(format_ci_table(summarize_bootstrap_ci(ecy_value_metrics, bootstrap["ecy_value_metrics"])).to_string())
+
+    print("\nLinear Weights (Excess CAPE Yield Percentile) performance:")
+    print(format_ci_table(summarize_bootstrap_ci(ecy_percentile_metrics, bootstrap["ecy_percentile_metrics"])).to_string())
 
     scan = scan_quantile_counts(returns, ecy, max_quantiles=5)
     print("\n=== Regime-Switching Portfolio: scanning 1-5 equidistant quantiles ===")
