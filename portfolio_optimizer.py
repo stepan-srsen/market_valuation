@@ -25,19 +25,32 @@ CACHE_DIR.mkdir(exist_ok=True)
 # yfinance tickers loaded alongside the MSCI factor indices, as (ticker, series name) pairs.
 YFINANCE_TICKERS = [
     ("GC=F", "Gold"),
-    # ("SI=F", "Silver"),
-    # ("^NDX", "Nasdaq 100"),
-    # ("^GSPC", "S&P 500"),
+    # ("SI=F", "Silver"), # from long-term perspective, silver is highly correlated with gold but more volatile
+    ("^NDX", "Nasdaq 100"),
+    # ("^GSPC", "S&P 500"), # MSCI world is similar but more diversified than S&P 500
+]
+
+# Partial names matched (as a substring) against each cached MSCI xlsx filename to select which
+# factor indices to load. Comment out entries to exclude them from the optimization.
+# the files from msci.com have to be present in the data_cache folder as they cannot be downloaded automatically and no proxy has long enough history
+MSCI_INDICES = [
+#    "MSCI World Index", # from long-term perspective, highly correlated with MSCI World Momentum and Dividend but with slightly worse Sharpe ratio
+#    "MSCI World Value Index", # from long-term perspective, highly correlated with MSCI World High Dividend but with slightly worse Sharpe ratio
+    "MSCI World Momentum Index",
+    "MSCI World Energy Index",
+    "MSCI World High Dividend Yield Index",
 ]
 
 # Annualized risk-free rate assumption used in the Sharpe ratio calculation.
 RISK_FREE_RATE = 0.0
-
 MONTHS_PER_YEAR = 12
 
 # Quantiles of the excess CAPE yield used to split history into valuation regimes.
-# DEFAULT_QUANTILES = [1/2]
+#DEFAULT_QUANTILES = [1/2]
 DEFAULT_QUANTILES = (1/3, 2/3)
+# DEFAULT_QUANTILES = (1/4, 2/4, 3/4)
+#DEFAULT_QUANTILES = (1/5, 2/5, 3/5, 4/5)
+
 
 # Block bootstrap settings used to estimate confidence intervals around the optimal portfolios.
 BOOTSTRAP_BLOCK_SIZE = 12
@@ -97,7 +110,9 @@ def load_excess_cape_yield(path: Path = DATA_DIR / "ie_data.xls") -> pd.Series:
 
 def load_all_prices() -> pd.DataFrame:
     """Load all constituent price series and align them to their maximum common date range."""
-    series = [load_msci_index(p) for p in sorted(glob.glob(str(CACHE_DIR / "*MSCI*.xlsx")))]
+    msci_paths = sorted(glob.glob(str(CACHE_DIR / "*MSCI*.xlsx")))
+    msci_paths = [p for p in msci_paths if any(name in Path(p).name for name in MSCI_INDICES)]
+    series = [load_msci_index(p) for p in msci_paths]
     series.extend(fetch_yfinance_monthly(ticker, name) for ticker, name in YFINANCE_TICKERS)
 
     prices = pd.concat(series, axis=1).sort_index()
