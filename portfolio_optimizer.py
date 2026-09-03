@@ -238,7 +238,7 @@ def quantile_buckets(ecy: pd.Series, quantiles=DEFAULT_QUANTILES) -> list[tuple[
 def regime_switching_weights_and_returns(
     returns: pd.DataFrame, ecy: pd.Series, quantiles
 ) -> tuple[list[pd.Series], pd.Series]:
-    """Like regime_switching_returns, but also returns each bucket's optimal weights (lowest to highest ECY)."""
+    """Optimize each Excess-CAPE-Yield bucket's weights and build the Regime-Switching Portfolio's return series."""
     bucket_weights = []
     parts = []
     for _, mask in quantile_buckets(ecy, quantiles):
@@ -249,12 +249,6 @@ def regime_switching_weights_and_returns(
     portfolio_returns = pd.concat(parts).sort_index()
     portfolio_returns.name = "Regime-Switching Portfolio"
     return bucket_weights, portfolio_returns
-
-
-def regime_switching_returns(returns: pd.DataFrame, ecy: pd.Series, quantiles) -> pd.Series:
-    """Build the Regime-Switching Portfolio's return series, optimizing each bucket's own weights quietly."""
-    _, portfolio_returns = regime_switching_weights_and_returns(returns, ecy, quantiles)
-    return portfolio_returns
 
 
 def circular_block_indices(n: int, block_size: int, rng: np.random.Generator) -> np.ndarray:
@@ -275,66 +269,58 @@ def block_bootstrap_resample(
     return resampled_returns, resampled_ecy
 
 
+def evaluate_regime_switching(
+    resampled_returns: pd.DataFrame, resampled_ecy: pd.Series, quantiles, bucket_weights: list[pd.Series]
+) -> pd.Series:
+    """Apply already-optimized per-bucket weights (lowest to highest ECY) to a return series, assigning
+    months to buckets by re-deriving Excess CAPE Yield quantile thresholds from resampled_ecy."""
+    parts = [
+        resampled_returns.loc[mask] @ weights
+        for (_, mask), weights in zip(quantile_buckets(resampled_ecy, quantiles), bucket_weights)
+    ]
+    portfolio_returns = pd.concat(parts).sort_index()
+    portfolio_returns.name = "Regime-Switching Portfolio"
+    return portfolio_returns
+
+
 def run_block_bootstrap(
     returns: pd.DataFrame,
     ecy: pd.Series,
+    full_weights: pd.Series,
+    bucket_weights: list[pd.Series],
     quantiles=DEFAULT_QUANTILES,
     n_iterations: int = BOOTSTRAP_ITERATIONS,
     block_size: int = BOOTSTRAP_BLOCK_SIZE,
 ) -> dict:
-    """Run a nested circular block bootstrap: re-optimize the Full-Period portfolio and, within each
-    resample, re-derive the Excess-CAPE-Yield buckets and re-optimize the Regime-Switching portfolio.
+    """Run a circular block bootstrap that evaluates the already-optimized Full-Period and
+    Regime-Switching portfolios (fixed weights) against resampled return paths; only the
+    Excess-CAPE-Yield bucket membership is re-derived per resample, not the weights themselves.
 
-    Returns a dict with "full_weights", "full_metrics", "bucket_weights" (list of per-bucket weight
-    DataFrames, lowest to highest ECY) and "regime_metrics", each a DataFrame with one row per
-    successful bootstrap iteration, plus "full_growth" and "regime_growth" arrays (one resampled
-    cumulative growth path per row, same column order as `returns`) used to band the growth plots.
+    Returns a dict with "full_metrics" and "regime_metrics" (one row per bootstrap iteration),
+    plus "full_growth" and "regime_growth" arrays (one resampled cumulative growth path per row,
+    same column order as `returns`) used to band the growth plots.
     """
     rng = np.random.default_rng()
-    n_buckets = len(quantiles) + 1
 
-    full_weights_rows = []
     full_metrics_rows = []
     full_growth_rows = []
-    bucket_weights_rows: list[list[pd.Series]] = [[] for _ in range(n_buckets)]
     regime_metrics_rows = []
     regime_growth_rows = []
-    n_failed = 0
 
     for _ in range(n_iterations):
-        try:
-            resampled_returns, resampled_ecy = block_bootstrap_resample(returns, ecy, block_size, rng)
+        resampled_returns, resampled_ecy = block_bootstrap_resample(returns, ecy, block_size, rng)
 
-            full_weights = optimize_sharpe(resampled_returns)
-            full_portfolio_returns = resampled_returns @ full_weights
-            full_metrics = performance_summary(full_portfolio_returns.to_frame(name="Optimal Portfolio")).iloc[0]
-
-            bucket_weights, regime_returns = regime_switching_weights_and_returns(
-                resampled_returns, resampled_ecy, quantiles
-            )
-            if len(bucket_weights) != n_buckets:
-                raise ValueError("Resample produced an unexpected number of Excess CAPE Yield buckets")
-            regime_metrics = performance_summary(regime_returns.to_frame()).iloc[0]
-        except (RuntimeError, ValueError):
-            n_failed += 1
-            continue
-
-        full_weights_rows.append(full_weights)
-        full_metrics_rows.append(full_metrics)
+        full_portfolio_returns = resampled_returns @ full_weights
+        full_metrics_rows.append(performance_summary(full_portfolio_returns.to_frame(name="Optimal Portfolio")).iloc[0])
         full_growth_rows.append((1.0 + full_portfolio_returns).cumprod().to_numpy())
-        for bucket_rows, weights in zip(bucket_weights_rows, bucket_weights):
-            bucket_rows.append(weights)
-        regime_metrics_rows.append(regime_metrics)
+
+        regime_returns = evaluate_regime_switching(resampled_returns, resampled_ecy, quantiles, bucket_weights)
+        regime_metrics_rows.append(performance_summary(regime_returns.to_frame()).iloc[0])
         regime_growth_rows.append((1.0 + regime_returns).cumprod().to_numpy())
 
-    if n_failed:
-        print(f"Warning: {n_failed}/{n_iterations} bootstrap iterations failed to converge and were skipped.")
-
     return {
-        "full_weights": pd.DataFrame(full_weights_rows),
         "full_metrics": pd.DataFrame(full_metrics_rows),
         "full_growth": np.array(full_growth_rows),
-        "bucket_weights": [pd.DataFrame(rows) for rows in bucket_weights_rows],
         "regime_metrics": pd.DataFrame(regime_metrics_rows),
         "regime_growth": np.array(regime_growth_rows),
     }
@@ -391,23 +377,20 @@ def scan_quantile_counts(
     """Scan 1 to max_quantiles equidistant quantile cut points (2 to max_quantiles+1 buckets).
 
     Returns a DataFrame indexed by number of quantiles, with MultiIndex columns (metric, stat)
-    where stat is one of "Estimate", "CI Lower", "CI Upper" from a block bootstrap re-run at
-    each quantile count (each resample re-derives its own Excess CAPE Yield buckets).
+    where stat is one of "Estimate", "CI Lower", "CI Upper". For each quantile count, weights are
+    optimized once on the original data and then evaluated (not re-optimized) against each resample.
     """
     rng = np.random.default_rng()
     rows = {}
     for n_quantiles in range(1, max_quantiles + 1):
         quantiles = tuple(i / (n_quantiles + 1) for i in range(1, n_quantiles + 1))
-        portfolio_returns = regime_switching_returns(returns, ecy, quantiles)
+        bucket_weights, portfolio_returns = regime_switching_weights_and_returns(returns, ecy, quantiles)
         estimate = performance_summary(portfolio_returns.to_frame()).iloc[0]
 
         metrics_rows = []
         for _ in range(n_iterations):
             resampled_returns, resampled_ecy = block_bootstrap_resample(returns, ecy, block_size, rng)
-            try:
-                resampled_portfolio_returns = regime_switching_returns(resampled_returns, resampled_ecy, quantiles)
-            except RuntimeError:
-                continue
+            resampled_portfolio_returns = evaluate_regime_switching(resampled_returns, resampled_ecy, quantiles, bucket_weights)
             metrics_rows.append(performance_summary(resampled_portfolio_returns.to_frame()).iloc[0])
         ci = summarize_bootstrap_ci(estimate, pd.DataFrame(metrics_rows), ci_level)
         rows[n_quantiles] = ci.stack()
@@ -499,12 +482,10 @@ def main() -> None:
     print(f"\n\nExcess CAPE Yield quantiles ({DEFAULT_QUANTILES}): "
           f"{[f'{q:.2f}%' for q in ecy.quantile(list(DEFAULT_QUANTILES))]}")
     regime_returns_parts = []
-    bucket_labels = []
     bucket_weights_list = []
     for label, mask in quantile_buckets(ecy, DEFAULT_QUANTILES):
         bucket_weights, bucket_portfolio_returns = analyze_and_report(returns.loc[mask], f"Excess CAPE Yield {label}")
         regime_returns_parts.append(bucket_portfolio_returns)
-        bucket_labels.append(label)
         bucket_weights_list.append(bucket_weights)
 
     # Chronological returns from rebalancing into each month's excess-CAPE-yield-range optimal weights.
@@ -525,7 +506,7 @@ def main() -> None:
     print(f"\n=== Block Bootstrap Confidence Intervals "
           f"(block size={BOOTSTRAP_BLOCK_SIZE} months, {BOOTSTRAP_ITERATIONS} iterations, "
           f"{BOOTSTRAP_CI_LEVEL:.0%} CI) ===")
-    bootstrap = run_block_bootstrap(returns, ecy, DEFAULT_QUANTILES)
+    bootstrap = run_block_bootstrap(returns, ecy, full_weights, bucket_weights_list, DEFAULT_QUANTILES)
 
     full_growth_ci = growth_ci_band(bootstrap["full_growth"], returns.index)
     plot_normalized(prices, portfolio_growth, ci_band=full_growth_ci)
@@ -536,14 +517,8 @@ def main() -> None:
         ci_band=regime_growth_ci,
     )
 
-    print("\nFull-Period Optimal Portfolio weights:")
-    print(format_ci_table(summarize_bootstrap_ci(full_weights, bootstrap["full_weights"])).to_string())
     print("\nFull-Period Optimal Portfolio performance:")
     print(format_ci_table(summarize_bootstrap_ci(full_metrics, bootstrap["full_metrics"])).to_string())
-
-    for label, original_bucket_weights, bucket_samples in zip(bucket_labels, bucket_weights_list, bootstrap["bucket_weights"]):
-        print(f"\nRegime-Switching bucket [{label}] weights:")
-        print(format_ci_table(summarize_bootstrap_ci(original_bucket_weights, bucket_samples)).to_string())
 
     print("\nRegime-Switching Portfolio performance:")
     print(format_ci_table(summarize_bootstrap_ci(regime_metrics, bootstrap["regime_metrics"])).to_string())
