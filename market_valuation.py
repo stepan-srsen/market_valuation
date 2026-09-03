@@ -110,59 +110,61 @@ def fetch_fred_csv(id: str) -> pd.Series:
 
 def fetch_sp500_earnings() -> pd.Series:
     """Fetch S&P 500 earnings data from S&P Global, cache it locally, and combine with historical data."""
-    filename = "sp-500-eps-est.xlsx"
-    cache_path = CACHE_DIR / filename
+    # filename = "sp-500-eps-est.xlsx"
+    # cache_path = CACHE_DIR / filename
     
-    # Check if file exists and was modified today
-    should_download = True
-    if cache_path.exists():
-        file_mod_time = dt.datetime.fromtimestamp(cache_path.stat().st_mtime)
-        if file_mod_time.date() == dt.datetime.now().date():
-            should_download = False
+    # # Check if file exists and was modified today
+    # should_download = True
+    # if cache_path.exists():
+    #     file_mod_time = dt.datetime.fromtimestamp(cache_path.stat().st_mtime)
+    #     if file_mod_time.date() == dt.datetime.now().date():
+    #         should_download = False
     
-    # Download if needed (Excel file, not CSV)
-    if should_download:
+    # # Download if needed (Excel file, not CSV)
+    # if should_download:
 
-        URL = "https://www.spglobal.com/spdji/en/documents/additional-material/sp-500-eps-est.xlsx"
-        headers = {
-            # Copy a recent Chrome UA from your machine (DevTools > Network)
-            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/126.0.0.0 Safari/537.36"),
-            "Accept": "application/octet-stream,*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            # Intentionally no Referer because pasting URL in a new tab has none
-            # Add the “sec-ch-ua*” and “sec-fetch-*” hints many CDNs expect:
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Dest": "document",
-            "Pragma": "no-cache",
-            "Cache-Control": "no-cache",
-        }
-        with httpx.Client(http2=True, headers=headers, follow_redirects=True, timeout=60) as client:
-            r = client.get(URL)
-            r.raise_for_status()
-            ct = r.headers.get("Content-Type", "")
-            # XLSX should be one of these MIME types:
-            assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ct or "application/octet-stream" in ct, ct
-            with open(cache_path, "wb") as f:
-                f.write(r.content)
-        print("Saved updated S&P 500 earnings data.")
+    #     URL = "https://www.spglobal.com/spdji/en/documents/additional-material/sp-500-eps-est.xlsx"
+    #     headers = {
+    #         # Copy a recent Chrome UA from your machine (DevTools > Network)
+    #         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    #                     "AppleWebKit/537.36 (KHTML, like Gecko) "
+    #                     "Chrome/126.0.0.0 Safari/537.36"),
+    #         "Accept": "application/octet-stream,*/*",
+    #         "Accept-Language": "en-US,en;q=0.9",
+    #         "Accept-Encoding": "gzip, deflate, br, zstd",
+    #         # Intentionally no Referer because pasting URL in a new tab has none
+    #         # Add the “sec-ch-ua*” and “sec-fetch-*” hints many CDNs expect:
+    #         "Sec-Fetch-Site": "none",
+    #         "Sec-Fetch-Mode": "navigate",
+    #         "Sec-Fetch-Dest": "document",
+    #         "Pragma": "no-cache",
+    #         "Cache-Control": "no-cache",
+    #     }
+    #     with httpx.Client(http2=True, headers=headers, follow_redirects=True, timeout=60) as client:
+    #         r = client.get(URL)
+    #         r.raise_for_status()
+    #         ct = r.headers.get("Content-Type", "")
+    #         # XLSX should be one of these MIME types:
+    #         assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ct or "application/octet-stream" in ct, ct
+    #         with open(cache_path, "wb") as f:
+    #             f.write(r.content)
+    #     print("Saved updated S&P 500 earnings data.")
 
-    df = pd.read_excel(cache_path, sheet_name='QUARTERLY DATA', header=None, skiprows=6, usecols=[0,2], index_col=0, parse_dates=True).squeeze()
-    df = df.dropna().sort_index() # drop missing values and sort
-    df = pd.to_numeric(df, errors='raise') # ensure earnings are numeric
-    df = df.rolling(window=4).sum().dropna() # calculate trailing 12-month (4 quarters)
+    # df = pd.read_excel(cache_path, sheet_name='QUARTERLY DATA', header=None, skiprows=6, usecols=[0,2], index_col=0, parse_dates=True).squeeze()
+    # df = df.dropna().sort_index() # drop missing values and sort
+    # df = pd.to_numeric(df, errors='raise') # ensure earnings are numeric
+    # df = df.rolling(window=4).sum().dropna() # calculate trailing 12-month (4 quarters)
 
     # Load historical data from local CSV
     df_history = pd.read_csv(DATA_DIR / "SP500EARNINGS.csv", index_col=0, parse_dates=True, dayfirst=True).squeeze()
     df_history = df_history.dropna().sort_index() # drop missing values and sort
     df_history = pd.to_numeric(df_history, errors='raise') # ensure earnings are numeric
-    df_history = df_history[df_history.index < df.index[0]] # take only historical data before fetched data
+    # df_history = df_history[df_history.index < df.index[0]] # take only historical data before fetched data
 
-    # Combine historical data with fetched data
-    df = pd.concat([df_history, df])
+    # # Combine historical data with fetched data
+    # df = pd.concat([df_history, df])
+
+    df = df_history  # Use only historical data for now, as fetching from S&P was discontinued
 
     # Set series name
     df.name = "SP500_Earnings"
@@ -310,7 +312,7 @@ def calc_buffett_indicator() -> pd.Series:
         detrend: If True and exponential_fit is True, return detrended data
     """
     # Fetch market cap data
-    market_cap = fetch_yfinance('^FTW5000').resample('D').ffill()
+    market_cap = fetch_yfinance('^W5000').resample('D').ffill() # '^W5000' vs '^FTW5000' ticker
     # Fetch GDP data with GDPNow extension
     gdp_data = fetch_us_gdp_and_gdpnow()
     # Align GDP to market cap dates
@@ -567,7 +569,9 @@ def plot_dual_axis(left_datasets, right_datasets=[], bear_markets=None, x_axis_l
     plt.show()
 
 if __name__ == "__main__":
+    # Enable interactive mode for non-blocking plots
     plt.ion()
+
     # Fetch datasets
     cpi_scaling = get_CPI_scaling()
     sp500 = fetch_yfinance('^GSPC').resample("D").ffill().rename("S&P 500 Index")
@@ -585,13 +589,38 @@ if __name__ == "__main__":
     bear_markets_1975 = detect_bear_markets(sp500_1975, threshold=0.2)
     plot_dual_axis(fit_exponential(sp500_1975, detrend=True, trends=True), [], bear_markets_1975, x_axis_labels=x_axis_labels, normalize_right=True)
 
+    # sp500 = fit_exponential(sp500, detrend=True, trends=False)
     plot_dual_axis(sp500, [buffet, cape10, ti10y], bear_markets, x_axis_labels=x_axis_labels, normalize_right=True)
 
     earnings_ratio = calc_treasury_cape_ratio(averaging_years=10)
     earnings_ratio = add_bands(earnings_ratio)
     plot_dual_axis(sp500, [earnings_ratio], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
 
+    plot_dual_axis(sp500, [ti10y], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
+
     excess_cape_yield = calc_excess_cape_yield(averaging_years=10)
+    excess_cape_yield5 = calc_excess_cape_yield(averaging_years=5)
+    excess_cape_yield4 = calc_excess_cape_yield(averaging_years=4)
+    excess_cape_yield3 = calc_excess_cape_yield(averaging_years=3)
+    excess_cape_yield2 = calc_excess_cape_yield(averaging_years=2)
+    excess_cape_yield1 = calc_excess_cape_yield(averaging_years=1)
     excess_cape_yield = add_bands(excess_cape_yield)
-    plot_dual_axis(sp500, [excess_cape_yield], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
+    # plot_dual_axis(sp500, [excess_cape_yield, excess_cape_yield5, excess_cape_yield3, excess_cape_yield1], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
+    plot_dual_axis(sp500, [excess_cape_yield, excess_cape_yield5, excess_cape_yield4, excess_cape_yield3, excess_cape_yield2, excess_cape_yield1], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
+
+
+    # gold = fetch_yfinance('GC=F').resample("D").ffill().rename("Gold")
+    # gold = fit_exponential(gold, detrend=False, trends=True)
+    # silver = fetch_yfinance('SI=F').resample("D").ffill().rename("Silver")
+    # silver = fit_exponential(silver, detrend=False, trends=True)
+    # plot_dual_axis([gold], [], x_axis_labels=FINANCIAL_CRISES, normalize_left=False, normalize_right=False, from_maxmin=False)
+
+    # alphabet = fetch_yfinance('GOOGL').resample("D").ffill().rename("Alphabet")
+    # alphabet = alphabet[alphabet.index >= pd.Timestamp("2015-01-01")]
+    # alphabet = fit_exponential(alphabet, detrend=False, trends=True)
+    # plot_dual_axis([alphabet], [], x_axis_labels=FINANCIAL_CRISES, normalize_left=False, normalize_right=False, from_maxmin=False)
+
+
+
+    # Keep plots open
     plt.show(block=True)
