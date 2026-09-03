@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from scipy.optimize import minimize
+from scipy.optimize import minimize, minimize_scalar
 
 DATA_DIR = Path(__file__).parent / "data"
 CACHE_DIR = Path(__file__).parent / "data_cache"
@@ -157,58 +157,76 @@ def optimize_sharpe(returns: pd.DataFrame) -> pd.Series:
     return pd.Series(result.x, index=returns.columns, name="Weight")
 
 
-def optimize_linear_weights(returns: pd.DataFrame, x: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """Fit each asset weight as w_i(t) = a_i + b_i * x(t), long-only and summing to 1 in every
-    month of the sample, maximizing the annualized Sharpe ratio of the resulting portfolio.
+def optimize_softmax_weights(returns: pd.DataFrame, x: pd.Series) -> tuple[pd.Series, pd.Series, float]:
+    """Fit softmax weights w_i(t) = softmax(a_i + b_i*x(t)) in two stages, maximizing the
+    annualized Sharpe ratio of the resulting portfolio at each stage:
 
-    Returns (intercepts, slopes), each a Series indexed by asset.
+    1. Fit the direction (a, b) on standardized x, with the slope vector constrained to unit norm
+       (at an implicit temperature of 1) - this picks which assets trade off against each other as
+       x moves, independent of how sharply.
+    2. Fix that direction and search over a single scalar temperature controlling how sharply
+       weights transition across it, discouraging the near-step-function transitions that result
+       from fitting an unconstrained slope directly.
+
+    Returns (intercepts, slopes, temperature); intercepts/slopes are Series indexed by asset, on
+    the original scale of x, already folded together with the fitted temperature.
     """
     assets = returns.columns
     n = len(assets)
-    x_values = x.to_numpy()
+    x_mean, x_std = x.mean(), x.std()
+    z_values = ((x - x_mean) / x_std).to_numpy()
     r_values = returns.to_numpy()
 
-    def weights_matrix(params: np.ndarray) -> np.ndarray:
-        a, b = params[:n], params[n:]
-        return a[None, :] + b[None, :] * x_values[:, None]  # shape (T, n)
-
-    def neg_sharpe(params: np.ndarray) -> float:
-        port_returns = (weights_matrix(params) * r_values).sum(axis=1)
+    def sharpe_of(scores: np.ndarray) -> float:
+        shifted = scores - scores.max(axis=1, keepdims=True)  # for numerical stability
+        exp_scores = np.exp(shifted)
+        weights = exp_scores / exp_scores.sum(axis=1, keepdims=True)
+        port_returns = (weights * r_values).sum(axis=1)
         mean_ann = port_returns.mean() * MONTHS_PER_YEAR
         vol_ann = port_returns.std() * np.sqrt(MONTHS_PER_YEAR)
-        return -(mean_ann - RISK_FREE_RATE) / vol_ann
+        return (mean_ann - RISK_FREE_RATE) / vol_ann
 
-    init_guess = np.concatenate([np.repeat(1.0 / n, n), np.zeros(n)])
-    constraints = (
-        {"type": "eq", "fun": lambda p: np.sum(p[:n]) - 1.0},
-        {"type": "eq", "fun": lambda p: np.sum(p[n:])},
-        {"type": "ineq", "fun": lambda p: weights_matrix(p).reshape(-1)},  # w(t) >= 0 every month
-        {"type": "ineq", "fun": lambda p: 1.0 - weights_matrix(p).reshape(-1)},  # w(t) <= 1 every month
+    def neg_sharpe_direction(params: np.ndarray) -> float:
+        a, b_z = params[:n], params[n:]
+        scores = a[None, :] + b_z[None, :] * z_values[:, None]
+        return -sharpe_of(scores)
+
+    init_direction = np.concatenate([np.zeros(n), np.full(n, 1.0 / np.sqrt(n))])
+    direction_result = minimize(
+        neg_sharpe_direction, init_direction, method="SLSQP",
+        constraints=({"type": "eq", "fun": lambda p: np.sum(p[n:] ** 2) - 1.0},),
+        options={"maxiter": 1000},
     )
+    if not direction_result.success:
+        raise RuntimeError(f"Softmax direction optimization failed: {direction_result.message}")
+    a_z, b_z = direction_result.x[:n], direction_result.x[n:]
 
-    result = minimize(neg_sharpe, init_guess, method="SLSQP", constraints=constraints, options={"maxiter": 1000})
-    if not result.success:
-        raise RuntimeError(f"Linear weight optimization failed: {result.message}")
-    a = pd.Series(result.x[:n], index=assets, name="Intercept")
-    b = pd.Series(result.x[n:], index=assets, name="Slope")
-    return a, b
+    def neg_sharpe_temperature(log_temperature: float) -> float:
+        temperature = np.exp(log_temperature)
+        scores = (a_z[None, :] + b_z[None, :] * z_values[:, None]) / temperature
+        return -sharpe_of(scores)
 
+    temperature_result = minimize_scalar(neg_sharpe_temperature, bounds=(-4.0, 4.0), method="bounded")
+    temperature = float(np.exp(temperature_result.x))
 
-def linear_weights_matrix(a: pd.Series, b: pd.Series, x: pd.Series) -> pd.DataFrame:
-    """Weights w_i(t) = a_i + b_i * x(t), clipped to [0, 1] and renormalized to sum to 1 per month.
-
-    Clipping is a no-op for the in-sample x the coefficients were fit on (already within bounds by
-    construction) and acts as a safety net when applying fixed coefficients to out-of-sample x, e.g.
-    a bootstrap resample.
-    """
-    raw = pd.DataFrame(x.to_numpy()[:, None] * b.to_numpy()[None, :] + a.to_numpy()[None, :], index=x.index, columns=a.index)
-    clipped = raw.clip(lower=0.0, upper=1.0)
-    return clipped.div(clipped.sum(axis=1), axis=0)
+    a_scaled, b_scaled = a_z / temperature, b_z / temperature
+    b = b_scaled / x_std
+    a = a_scaled - b_scaled * x_mean / x_std
+    return pd.Series(a, index=assets, name="Intercept"), pd.Series(b, index=assets, name="Slope"), temperature
 
 
-def linear_portfolio_returns(returns: pd.DataFrame, a: pd.Series, b: pd.Series, x: pd.Series) -> pd.Series:
-    """Portfolio returns from applying the linear weight function w_i(t) = a_i + b_i*x(t)."""
-    weights = linear_weights_matrix(a, b, x)
+def softmax_weights_matrix(a: pd.Series, b: pd.Series, x: pd.Series) -> pd.DataFrame:
+    """Weights w_i(t) = softmax(a_i + b_i * x(t)) across assets: long-only and summing to 1 by
+    construction for any x, in-sample or out-of-sample (e.g. a bootstrap resample)."""
+    scores = pd.DataFrame(x.to_numpy()[:, None] * b.to_numpy()[None, :] + a.to_numpy()[None, :], index=x.index, columns=a.index)
+    shifted = scores.sub(scores.max(axis=1), axis=0)  # for numerical stability
+    exp_scores = np.exp(shifted)
+    return exp_scores.div(exp_scores.sum(axis=1), axis=0)
+
+
+def softmax_portfolio_returns(returns: pd.DataFrame, a: pd.Series, b: pd.Series, x: pd.Series) -> pd.Series:
+    """Portfolio returns from applying the softmax weight function w_i(t) = softmax(a_i + b_i*x(t))."""
+    weights = softmax_weights_matrix(a, b, x)
     return (returns * weights).sum(axis=1)
 
 
@@ -272,13 +290,13 @@ def analyze_and_report(returns: pd.DataFrame, title: str) -> tuple[pd.Series, pd
     return weights, portfolio_returns
 
 
-def analyze_and_report_linear(returns: pd.DataFrame, x: pd.Series, title: str) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """Fit linear weights w_i(t) = a_i + b_i*x(t) maximizing Sharpe, print coefficients and performance.
+def analyze_and_report_softmax(returns: pd.DataFrame, x: pd.Series, title: str) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Fit softmax weights w_i(t) = softmax(a_i + b_i*x(t)) maximizing Sharpe, print coefficients and performance.
 
     Returns (intercepts, slopes, portfolio_returns) so callers can reuse the fit elsewhere.
     """
-    a, b = optimize_linear_weights(returns, x)
-    portfolio_returns = linear_portfolio_returns(returns, a, b, x)
+    a, b, temperature = optimize_softmax_weights(returns, x)
+    portfolio_returns = softmax_portfolio_returns(returns, a, b, x)
     portfolio_returns.name = "Optimal Portfolio"
 
     all_returns = returns.copy()
@@ -286,7 +304,7 @@ def analyze_and_report_linear(returns: pd.DataFrame, x: pd.Series, title: str) -
     summary = performance_summary(all_returns)
 
     print(f"\n=== {title} ({len(returns)} months) ===")
-    print("Linear weight coefficients (Weight = Intercept + Slope * x):")
+    print(f"Softmax weight coefficients (Weight = softmax(Intercept + Slope * x)), temperature={temperature:.4f}:")
     print(pd.DataFrame({"Intercept": a, "Slope": b}).map(lambda v: f"{v:.4f}").to_string())
     print()
     print("Performance summary:")
@@ -374,9 +392,9 @@ def run_block_bootstrap(
     block_size: int = BOOTSTRAP_BLOCK_SIZE,
 ) -> dict:
     """Run a circular block bootstrap that evaluates the already-optimized Full-Period,
-    Regime-Switching and linear-weight (in ECY value / ECY percentile) portfolios (all fixed
+    Regime-Switching and softmax-weight (in ECY value / ECY percentile) portfolios (all fixed
     weights/coefficients) against resampled return paths. Only the Excess-CAPE-Yield bucket
-    membership (Regime-Switching) and percentile rank (linear-in-percentile) are re-derived per
+    membership (Regime-Switching) and percentile rank (softmax-in-percentile) are re-derived per
     resample, not the weights/coefficients themselves.
 
     Returns a dict with "<key>_metrics" (one row per bootstrap iteration) and "<key>_growth"
@@ -405,12 +423,12 @@ def run_block_bootstrap(
         rows["regime_metrics"].append(performance_summary(regime_returns.to_frame()).iloc[0])
         rows["regime_growth"].append((1.0 + regime_returns).cumprod().to_numpy())
 
-        ecy_value_returns = linear_portfolio_returns(resampled_returns, ecy_value_a, ecy_value_b, resampled_ecy)
+        ecy_value_returns = softmax_portfolio_returns(resampled_returns, ecy_value_a, ecy_value_b, resampled_ecy)
         rows["ecy_value_metrics"].append(performance_summary(ecy_value_returns.to_frame(name="Optimal Portfolio")).iloc[0])
         rows["ecy_value_growth"].append((1.0 + ecy_value_returns).cumprod().to_numpy())
 
         resampled_percentile = resampled_ecy.rank(pct=True)
-        ecy_percentile_returns = linear_portfolio_returns(resampled_returns, ecy_percentile_a, ecy_percentile_b, resampled_percentile)
+        ecy_percentile_returns = softmax_portfolio_returns(resampled_returns, ecy_percentile_a, ecy_percentile_b, resampled_percentile)
         rows["ecy_percentile_metrics"].append(performance_summary(ecy_percentile_returns.to_frame(name="Optimal Portfolio")).iloc[0])
         rows["ecy_percentile_growth"].append((1.0 + ecy_percentile_returns).cumprod().to_numpy())
 
@@ -516,18 +534,18 @@ def plot_quantile_scan(scan: pd.DataFrame, ci_level: float = BOOTSTRAP_CI_LEVEL)
     plt.show()
 
 
-def plot_linear_weights(
+def plot_softmax_weights(
     a: pd.Series, b: pd.Series, x: pd.Series, xlabel: str, title: str,
     x_axis_map: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> None:
-    """Plot each asset's linear weight function w_i(x) = a_i + b_i*x (clipped/renormalized) over the observed range of x.
+    """Plot each asset's softmax weight function w_i(x) = softmax(a_i + b_i*x) over the observed range of x.
 
     x_axis_map, if given, maps the linspace grid of x (e.g. an Excess CAPE Yield percentile) to the
     values shown on the x-axis (e.g. actual Excess CAPE Yield via its empirical quantile function),
     producing a nonlinear curve when displayed against a variable other than the one w is linear in.
     """
     x_grid = np.linspace(x.min(), x.max(), 200)
-    weights = linear_weights_matrix(a, b, pd.Series(x_grid))
+    weights = softmax_weights_matrix(a, b, pd.Series(x_grid))
     x_axis = x_axis_map(x_grid) if x_axis_map is not None else x_grid
 
     fig, ax = plt.subplots(figsize=(12, 7))
@@ -630,22 +648,22 @@ def main() -> None:
     regime_growth = (1.0 + regime_returns).cumprod()
 
     ecy_percentile = ecy.rank(pct=True)
-    ecy_value_a, ecy_value_b, ecy_value_returns = analyze_and_report_linear(
-        returns, ecy, "Linear Weights (Excess CAPE Yield)")
-    ecy_value_returns.name = "Linear Weights (ECY)"
+    ecy_value_a, ecy_value_b, ecy_value_returns = analyze_and_report_softmax(
+        returns, ecy, "Softmax Weights (Excess CAPE Yield)")
+    ecy_value_returns.name = "Softmax Weights (ECY)"
     ecy_value_metrics = performance_summary(ecy_value_returns.to_frame()).iloc[0]
     ecy_value_growth = (1.0 + ecy_value_returns).cumprod()
-    plot_linear_weights(
+    plot_softmax_weights(
         ecy_value_a, ecy_value_b, ecy,
         xlabel="Excess CAPE Yield (%)", title="Portfolio Weights vs Excess CAPE Yield",
     )
 
-    ecy_percentile_a, ecy_percentile_b, ecy_percentile_returns = analyze_and_report_linear(
-        returns, ecy_percentile, "Linear Weights (Excess CAPE Yield Percentile)")
-    ecy_percentile_returns.name = "Linear Weights (ECY Percentile)"
+    ecy_percentile_a, ecy_percentile_b, ecy_percentile_returns = analyze_and_report_softmax(
+        returns, ecy_percentile, "Softmax Weights (Excess CAPE Yield Percentile)")
+    ecy_percentile_returns.name = "Softmax Weights (ECY Percentile)"
     ecy_percentile_metrics = performance_summary(ecy_percentile_returns.to_frame()).iloc[0]
     ecy_percentile_growth = (1.0 + ecy_percentile_returns).cumprod()
-    plot_linear_weights(
+    plot_softmax_weights(
         ecy_percentile_a, ecy_percentile_b, ecy_percentile,
         xlabel="Excess CAPE Yield (%)", title="Portfolio Weights vs Excess CAPE Yield Percentile",
         x_axis_map=lambda grid: ecy.quantile(grid).to_numpy(),
@@ -670,14 +688,14 @@ def main() -> None:
 
     ecy_value_growth_ci = growth_ci_band(bootstrap["ecy_value_growth"], returns.index)
     plot_normalized(
-        prices, ecy_value_growth, title="Normalized Performance \u2014 Linear Weights (Excess CAPE Yield, start = 100)",
+        prices, ecy_value_growth, title="Normalized Performance \u2014 Softmax Weights (Excess CAPE Yield, start = 100)",
         ci_band=ecy_value_growth_ci,
     )
 
     ecy_percentile_growth_ci = growth_ci_band(bootstrap["ecy_percentile_growth"], returns.index)
     plot_normalized(
         prices, ecy_percentile_growth,
-        title="Normalized Performance \u2014 Linear Weights (Excess CAPE Yield Percentile, start = 100)",
+        title="Normalized Performance \u2014 Softmax Weights (Excess CAPE Yield Percentile, start = 100)",
         ci_band=ecy_percentile_growth_ci,
     )
 
@@ -687,10 +705,10 @@ def main() -> None:
     print("\nRegime-Switching Portfolio performance:")
     print(format_ci_table(summarize_bootstrap_ci(regime_metrics, bootstrap["regime_metrics"])).to_string())
 
-    print("\nLinear Weights (Excess CAPE Yield) performance:")
+    print("\nSoftmax Weights (Excess CAPE Yield) performance:")
     print(format_ci_table(summarize_bootstrap_ci(ecy_value_metrics, bootstrap["ecy_value_metrics"])).to_string())
 
-    print("\nLinear Weights (Excess CAPE Yield Percentile) performance:")
+    print("\nSoftmax Weights (Excess CAPE Yield Percentile) performance:")
     print(format_ci_table(summarize_bootstrap_ci(ecy_percentile_metrics, bootstrap["ecy_percentile_metrics"])).to_string())
 
     scan = scan_quantile_counts(returns, ecy, max_quantiles=5)
