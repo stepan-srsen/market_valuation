@@ -8,6 +8,10 @@ Aligns all series to their maximum common date range, finds the long-only weight
 maximize the Sharpe ratio (mean-variance optimization), and reports performance,
 volatility, Sharpe ratio and maximum drawdown for the optimal portfolio and its constituents.
 """
+
+# TODO: implement nested bootstrap for better optimizaton on simulated series and reliable confidence intervals
+# TODO: improve softmax portfolio optimization based on literature
+
 import datetime as dt
 import glob
 from collections.abc import Callable
@@ -29,6 +33,10 @@ YFINANCE_TICKERS = [
     # ("SI=F", "Silver"), # from long-term perspective, silver is highly correlated with gold but more volatile
     ("^NDX", "Nasdaq 100"),
     # ("^GSPC", "S&P 500"), # MSCI world is similar but more diversified than S&P 500
+    # ("ZN=F", "10-Year Treasury Bond Futures"), # ~(7-10y)
+    # ("ZB=F", "30-Year Treasury Bond Futures"), # ~(15-25y)
+    # ("TLT", "iShares 20+ Year Treasury Bond ETF"), # oldest 20+y Treasury Bond ETF
+    ("VUSTX", "Vanguard Long-Term Treasury Inv"), # proxy to long-term (10+y) US Treasury bond etf with longer history
 ]
 
 # Partial names matched (as a substring) against each cached MSCI xlsx filename to select which
@@ -48,9 +56,9 @@ MONTHS_PER_YEAR = 12
 
 # Quantiles of the excess CAPE yield used to split history into valuation regimes.
 DEFAULT_QUANTILES = [1/2]
-#DEFAULT_QUANTILES = (1/3, 2/3)
+# DEFAULT_QUANTILES = (1/3, 2/3)
 # DEFAULT_QUANTILES = (1/4, 2/4, 3/4)
-#DEFAULT_QUANTILES = (1/5, 2/5, 3/5, 4/5)
+# DEFAULT_QUANTILES = (1/5, 2/5, 3/5, 4/5)
 
 
 # Block bootstrap settings used to estimate confidence intervals around the optimal portfolios.
@@ -207,6 +215,7 @@ def optimize_softmax_weights(returns: pd.DataFrame, x: pd.Series) -> tuple[pd.Se
         return -sharpe_of(scores)
 
     temperature_result = minimize_scalar(neg_sharpe_temperature, bounds=(-4.0, 4.0), method="bounded")
+    print("temperature_result", temperature_result.x)
     temperature = float(np.exp(temperature_result.x))
 
     a_scaled, b_scaled = a_z / temperature, b_z / temperature
