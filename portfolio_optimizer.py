@@ -9,7 +9,6 @@ maximize the Sharpe ratio (mean-variance optimization), and reports performance,
 volatility, Sharpe ratio and maximum drawdown for the optimal portfolio and its constituents.
 """
 
-# TODO: implement nested bootstrap for better optimizaton on simulated series and reliable confidence intervals
 # TODO: improve softmax portfolio optimization based on literature
 
 import datetime as dt
@@ -30,7 +29,7 @@ CACHE_DIR.mkdir(exist_ok=True)
 # yfinance tickers loaded alongside the MSCI factor indices, as (ticker, series name) pairs.
 YFINANCE_TICKERS = [
     ("GC=F", "Gold"),
-    # ("SI=F", "Silver"), # from long-term perspective, silver is highly correlated with gold but more volatile
+    #("SI=F", "Silver"), # from long-term perspective, silver is highly correlated with gold but more volatile
     ("^NDX", "Nasdaq 100"),
     # ("^GSPC", "S&P 500"), # MSCI world is similar but more diversified than S&P 500
     # ("ZN=F", "10-Year Treasury Bond Futures"), # ~(7-10y)
@@ -55,8 +54,8 @@ RISK_FREE_RATE = 0.0
 MONTHS_PER_YEAR = 12
 
 # Quantiles of the excess CAPE yield used to split history into valuation regimes.
-DEFAULT_QUANTILES = [1/2]
-# DEFAULT_QUANTILES = (1/3, 2/3)
+# DEFAULT_QUANTILES = [1/2]
+DEFAULT_QUANTILES = (1/3, 2/3)
 # DEFAULT_QUANTILES = (1/4, 2/4, 3/4)
 # DEFAULT_QUANTILES = (1/5, 2/5, 3/5, 4/5)
 
@@ -67,6 +66,10 @@ BOOTSTRAP_ITERATIONS = 1000
 BOOTSTRAP_CI_LEVEL = 0.90
 # Fewer iterations for the quantile-count scan, which reruns the bootstrap once per quantile count.
 BOOTSTRAP_SCAN_ITERATIONS = 200
+# Number of bootstrap copies used to re-optimize (bag) the portfolios before the evaluation
+# bootstrap. Kept lower than BOOTSTRAP_ITERATIONS since every copy reruns all the optimizers
+# (the softmax fits dominate the cost).
+BOOTSTRAP_OPT_ITERATIONS = 200
 
 def load_msci_index(path: Path) -> pd.Series:
     """Load a monthly MSCI index export (xlsx) and return a Series indexed by month Period."""
@@ -215,7 +218,6 @@ def optimize_softmax_weights(returns: pd.DataFrame, x: pd.Series) -> tuple[pd.Se
         return -sharpe_of(scores)
 
     temperature_result = minimize_scalar(neg_sharpe_temperature, bounds=(-4.0, 4.0), method="bounded")
-    print("temperature_result", temperature_result.x)
     temperature = float(np.exp(temperature_result.x))
 
     a_scaled, b_scaled = a_z / temperature, b_z / temperature
@@ -274,6 +276,17 @@ def format_summary(summary: pd.DataFrame) -> pd.DataFrame:
         formatted[col] = formatted[col].map(lambda v: f"{v:.2%}")
     formatted["Sharpe Ratio"] = formatted["Sharpe Ratio"].map(lambda v: f"{v:.2f}")
     return formatted
+
+
+def report_portfolio(returns: pd.DataFrame, portfolio_returns: pd.Series, title: str) -> pd.DataFrame:
+    """Print the performance summary of an already-built portfolio return series, alongside constituents."""
+    all_returns = returns.copy()
+    all_returns[portfolio_returns.name] = portfolio_returns
+    summary = performance_summary(all_returns)
+    print(f"\n=== {title} ({len(returns)} months) ===")
+    print("Performance summary:")
+    print(format_summary(summary).to_string())
+    return summary
 
 
 def analyze_and_report(returns: pd.DataFrame, title: str) -> tuple[pd.Series, pd.Series]:
@@ -389,30 +402,113 @@ def evaluate_regime_switching(
     return portfolio_returns
 
 
+def softmax_ensemble_weights_matrix(coeffs: list[tuple[pd.Series, pd.Series]], x: pd.Series) -> pd.DataFrame:
+    """Bootstrap-averaged softmax weight function W_i(x) = (1/K) * sum_k softmax(a_k,i + b_k,i*x(t)).
+
+    Averages the fitted weight functions themselves (not the coefficients), so the ensemble
+    weights stay long-only and sum to 1 at every x, in-sample or on any bootstrap resample.
+    """
+    x_values = x.to_numpy()
+    assets = coeffs[0][0].index
+    total = np.zeros((len(x_values), len(assets)))
+    for a, b in coeffs:
+        scores = x_values[:, None] * b.reindex(assets).to_numpy()[None, :] + a.reindex(assets).to_numpy()[None, :]
+        shifted = scores - scores.max(axis=1, keepdims=True)  # for numerical stability
+        exp_scores = np.exp(shifted)
+        total += exp_scores / exp_scores.sum(axis=1, keepdims=True)
+    return pd.DataFrame(total / len(coeffs), index=x.index, columns=assets)
+
+
+def softmax_ensemble_portfolio_returns(returns: pd.DataFrame, coeffs: list[tuple[pd.Series, pd.Series]], x: pd.Series) -> pd.Series:
+    """Portfolio returns from applying the bootstrap-averaged softmax weight function."""
+    weights = softmax_ensemble_weights_matrix(coeffs, x)
+    return (returns * weights).sum(axis=1)
+
+
+def average_weight_vectors(weights_list: list[pd.Series]) -> pd.Series:
+    """Mean weight vector across bootstrap fits, renormalized to sum to 1."""
+    avg = pd.concat(weights_list, axis=1).mean(axis=1)
+    return (avg / avg.sum()).rename("Weight")
+
+
+def bag_optimized_portfolios(
+    returns: pd.DataFrame,
+    ecy: pd.Series,
+    quantiles=DEFAULT_QUANTILES,
+    n_iterations: int = BOOTSTRAP_OPT_ITERATIONS,
+    block_size: int = BOOTSTRAP_BLOCK_SIZE,
+) -> dict:
+    """Outer (optimization) bootstrap: re-optimize every strategy on each circular-block resample
+    of (returns, ECY) and average the optimized portfolios across the bootstrap copies (bagging).
+
+    This regularizes each in-sample optimum toward what the optimizers pick on plausible
+    alternative histories, instead of trusting the single optimum found on the observed path.
+
+    Returns a dict with:
+      "full": bagged full-period Sharpe-optimal weights (Series)
+      "regime": bagged per-bucket weights, lowest to highest ECY (list of Series)
+      "ecy_value": per-copy (intercepts, slopes) pairs of the softmax-in-ECY-value fits (list)
+      "ecy_percentile": same for the softmax-in-ECY-percentile fits (list)
+    """
+    rng = np.random.default_rng()
+    n_buckets = len(quantile_buckets(ecy, quantiles))
+    full_list: list[pd.Series] = []
+    bucket_lists: list[list[pd.Series]] = [[] for _ in range(n_buckets)]
+    value_coeffs: list[tuple[pd.Series, pd.Series]] = []
+    percentile_coeffs: list[tuple[pd.Series, pd.Series]] = []
+    failed = 0
+
+    for _ in range(n_iterations):
+        resampled_returns, resampled_ecy = block_bootstrap_resample(returns, ecy, block_size, rng)
+        try:
+            full_w = optimize_sharpe(resampled_returns)
+            bucket_ws, _ = regime_switching_weights_and_returns(resampled_returns, resampled_ecy, quantiles)
+            value_ab = optimize_softmax_weights(resampled_returns, resampled_ecy)[:2]
+            percentile_ab = optimize_softmax_weights(resampled_returns, resampled_ecy.rank(pct=True))[:2]
+        except Exception:
+            failed += 1
+            continue
+        full_list.append(full_w)
+        for i, w in enumerate(bucket_ws):
+            bucket_lists[i].append(w)
+        value_coeffs.append(value_ab)
+        percentile_coeffs.append(percentile_ab)
+
+    if failed:
+        print(f"Bagging: skipped {failed}/{n_iterations} resamples where an optimizer failed.")
+    if not full_list:
+        raise RuntimeError("Every bagging resample failed to optimize.")
+
+    return {
+        "full": average_weight_vectors(full_list),
+        "regime": [average_weight_vectors(lst) for lst in bucket_lists],
+        "ecy_value": value_coeffs,
+        "ecy_percentile": percentile_coeffs,
+    }
+
+
 def run_block_bootstrap(
     returns: pd.DataFrame,
     ecy: pd.Series,
     full_weights: pd.Series,
     bucket_weights: list[pd.Series],
-    ecy_value_coeffs: tuple[pd.Series, pd.Series],
-    ecy_percentile_coeffs: tuple[pd.Series, pd.Series],
+    ecy_value_coeffs: list[tuple[pd.Series, pd.Series]],
+    ecy_percentile_coeffs: list[tuple[pd.Series, pd.Series]],
     quantiles=DEFAULT_QUANTILES,
     n_iterations: int = BOOTSTRAP_ITERATIONS,
     block_size: int = BOOTSTRAP_BLOCK_SIZE,
 ) -> dict:
-    """Run a circular block bootstrap that evaluates the already-optimized Full-Period,
-    Regime-Switching and softmax-weight (in ECY value / ECY percentile) portfolios (all fixed
-    weights/coefficients) against resampled return paths. Only the Excess-CAPE-Yield bucket
-    membership (Regime-Switching) and percentile rank (softmax-in-percentile) are re-derived per
-    resample, not the weights/coefficients themselves.
+    """Evaluation bootstrap: run a circular block bootstrap that evaluates the bagged
+    (bootstrap-averaged) Full-Period, Regime-Switching and softmax-weight (in ECY value / ECY
+    percentile) portfolios (all fixed weights/weight-functions) against fresh resampled return
+    paths. Only the Excess-CAPE-Yield bucket membership (Regime-Switching) and percentile rank
+    (softmax-in-percentile) are re-derived per resample, not the weights/coefficients themselves.
 
     Returns a dict with "<key>_metrics" (one row per bootstrap iteration) and "<key>_growth"
     (one resampled cumulative growth path per row, same column order as `returns`) for each of
     "full", "regime", "ecy_value" and "ecy_percentile".
     """
     rng = np.random.default_rng()
-    ecy_value_a, ecy_value_b = ecy_value_coeffs
-    ecy_percentile_a, ecy_percentile_b = ecy_percentile_coeffs
 
     rows: dict[str, list] = {
         "full_metrics": [], "full_growth": [],
@@ -432,12 +528,12 @@ def run_block_bootstrap(
         rows["regime_metrics"].append(performance_summary(regime_returns.to_frame()).iloc[0])
         rows["regime_growth"].append((1.0 + regime_returns).cumprod().to_numpy())
 
-        ecy_value_returns = softmax_portfolio_returns(resampled_returns, ecy_value_a, ecy_value_b, resampled_ecy)
+        ecy_value_returns = softmax_ensemble_portfolio_returns(resampled_returns, ecy_value_coeffs, resampled_ecy)
         rows["ecy_value_metrics"].append(performance_summary(ecy_value_returns.to_frame(name="Optimal Portfolio")).iloc[0])
         rows["ecy_value_growth"].append((1.0 + ecy_value_returns).cumprod().to_numpy())
 
         resampled_percentile = resampled_ecy.rank(pct=True)
-        ecy_percentile_returns = softmax_portfolio_returns(resampled_returns, ecy_percentile_a, ecy_percentile_b, resampled_percentile)
+        ecy_percentile_returns = softmax_ensemble_portfolio_returns(resampled_returns, ecy_percentile_coeffs, resampled_percentile)
         rows["ecy_percentile_metrics"].append(performance_summary(ecy_percentile_returns.to_frame(name="Optimal Portfolio")).iloc[0])
         rows["ecy_percentile_growth"].append((1.0 + ecy_percentile_returns).cumprod().to_numpy())
 
@@ -455,22 +551,25 @@ def run_block_bootstrap(
 
 def growth_ci_band(
     growth_paths: np.ndarray, index: pd.Index, ci_level: float = BOOTSTRAP_CI_LEVEL
-) -> tuple[pd.Series, pd.Series]:
-    """Per-period percentile band (lower, upper) of raw cumulative growth across bootstrap iterations."""
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Per-period (lower, mean, upper) band of raw cumulative growth across bootstrap iterations."""
     alpha = (1.0 - ci_level) / 2.0
     lower = pd.Series(np.quantile(growth_paths, alpha, axis=0), index=index)
+    mean = pd.Series(growth_paths.mean(axis=0), index=index)
     upper = pd.Series(np.quantile(growth_paths, 1.0 - alpha, axis=0), index=index)
-    return lower, upper
+    return lower, mean, upper
 
 
 def summarize_bootstrap_ci(
     original: pd.Series, samples: pd.DataFrame, ci_level: float = BOOTSTRAP_CI_LEVEL
 ) -> pd.DataFrame:
-    """Combine point estimates (from the original, non-resampled data) with bootstrap percentile CIs."""
+    """Combine point estimates (from the original, non-resampled data), the mean across bootstrap
+    resamples, and bootstrap percentile CIs."""
     alpha = (1.0 - ci_level) / 2.0
+    bootstrap_mean = samples.mean()
     lower = samples.quantile(alpha)
     upper = samples.quantile(1.0 - alpha)
-    return pd.DataFrame({"Estimate": original, "CI Lower": lower, "CI Upper": upper})
+    return pd.DataFrame({"Estimate": original, "Bootstrap Mean": bootstrap_mean, "CI Lower": lower, "CI Upper": upper})
 
 
 def format_ci_table(ci: pd.DataFrame) -> pd.DataFrame:
@@ -504,8 +603,9 @@ def scan_quantile_counts(
     """Scan 1 to max_quantiles equidistant quantile cut points (2 to max_quantiles+1 buckets).
 
     Returns a DataFrame indexed by number of quantiles, with MultiIndex columns (metric, stat)
-    where stat is one of "Estimate", "CI Lower", "CI Upper". For each quantile count, weights are
-    optimized once on the original data and then evaluated (not re-optimized) against each resample.
+    where stat is one of "Estimate", "Bootstrap Mean", "CI Lower", "CI Upper". For each quantile
+    count, weights are optimized once on the original data and then evaluated (not re-optimized)
+    against each resample.
     """
     rng = np.random.default_rng()
     rows = {}
@@ -543,18 +643,21 @@ def plot_quantile_scan(scan: pd.DataFrame, ci_level: float = BOOTSTRAP_CI_LEVEL)
     plt.show()
 
 
-def plot_softmax_weights(
-    a: pd.Series, b: pd.Series, x: pd.Series, xlabel: str, title: str,
+def plot_softmax_ensemble_weights(
+    coeffs: list[tuple[pd.Series, pd.Series]], x: pd.Series, xlabel: str, title: str,
     x_axis_map: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> None:
-    """Plot each asset's softmax weight function w_i(x) = softmax(a_i + b_i*x) over the observed range of x.
+    """Plot each asset's bagged softmax weight function W_i(x) = (1/K) * sum_k softmax(a_k,i + b_k,i*x).
+
+    coeffs, if given as a list of (intercepts, slopes) pairs from the bootstrap copies, is averaged
+    at the weight level; a single (intercepts, slopes) pair also works (list of one).
 
     x_axis_map, if given, maps the linspace grid of x (e.g. an Excess CAPE Yield percentile) to the
     values shown on the x-axis (e.g. actual Excess CAPE Yield via its empirical quantile function),
     producing a nonlinear curve when displayed against a variable other than the one w is linear in.
     """
     x_grid = np.linspace(x.min(), x.max(), 200)
-    weights = softmax_weights_matrix(a, b, pd.Series(x_grid))
+    weights = softmax_ensemble_weights_matrix(coeffs, pd.Series(x_grid))
     x_axis = x_axis_map(x_grid) if x_axis_map is not None else x_grid
 
     fig, ax = plt.subplots(figsize=(12, 7))
@@ -573,13 +676,14 @@ def plot_normalized(
     prices: pd.DataFrame,
     portfolio_growth: pd.Series,
     title: str = "Normalized Performance (start = 100)",
-    ci_band: tuple[pd.Series, pd.Series] | None = None,
+    ci_band: tuple[pd.Series, pd.Series, pd.Series] | None = None,
     ci_level: float = BOOTSTRAP_CI_LEVEL,
 ) -> None:
     """Plot constituents and a portfolio growth series, all normalized to start at 100.
 
-    ci_band, if given, is a (lower, upper) pair of raw cumulative growth bootstrap percentiles
-    (same baseline/scale as portfolio_growth) shaded around the portfolio line.
+    ci_band, if given, is a (lower, mean, upper) triple of raw cumulative growth bootstrap
+    statistics (same baseline/scale as portfolio_growth): the percentile band shaded around the
+    portfolio line and the mean growth path across bootstrap resamples as a dashed line.
     """
     normalized = prices / prices.iloc[0] * 100.0
     portfolio_normalized = portfolio_growth / portfolio_growth.iloc[0] * 100.0
@@ -589,13 +693,16 @@ def plot_normalized(
     for col in normalized.columns:
         ax.plot(normalized.index, normalized[col], label=col, alpha=0.7)
     if ci_band is not None:
-        lower, upper = ci_band
+        lower, mean, upper = ci_band
         lower_normalized = lower / portfolio_growth.iloc[0] * 100.0
+        mean_normalized = mean / portfolio_growth.iloc[0] * 100.0
         upper_normalized = upper / portfolio_growth.iloc[0] * 100.0
         ax.fill_between(
             portfolio_normalized.index, lower_normalized, upper_normalized,
             color="black", alpha=0.15, label=f"{label} {ci_level:.0%} bootstrap CI",
         )
+        ax.plot(mean_normalized.index, mean_normalized, color="black", linestyle="--", linewidth=1.5,
+                label=f"{label} bootstrap mean")
     ax.plot(portfolio_normalized.index, portfolio_normalized, label=label, color="black", linewidth=2.5)
 
     ax.set_title(title)
@@ -629,17 +736,13 @@ def main() -> None:
     print(f"Latest Excess CAPE Yield: {ecy.iloc[-1]:.2f}%\n")
 
     full_weights, portfolio_returns = analyze_and_report(returns, "Full Period")
-    full_metrics = performance_summary(portfolio_returns.to_frame()).iloc[0]
-    portfolio_growth = (1.0 + portfolio_returns).cumprod()
 
     print(f"\n\nExcess CAPE Yield quantiles ({DEFAULT_QUANTILES}): "
           f"{[f'{q:.2f}%' for q in ecy.quantile(list(DEFAULT_QUANTILES))]}")
     regime_returns_parts = []
-    bucket_weights_list = []
     for label, mask in quantile_buckets(ecy, DEFAULT_QUANTILES):
         bucket_weights, bucket_portfolio_returns = analyze_and_report(returns.loc[mask], f"Excess CAPE Yield {label}")
         regime_returns_parts.append(bucket_portfolio_returns)
-        bucket_weights_list.append(bucket_weights)
 
     # Chronological returns from rebalancing into each month's excess-CAPE-yield-range optimal weights.
     regime_returns = pd.concat(regime_returns_parts).sort_index()
@@ -648,77 +751,106 @@ def main() -> None:
     all_returns_with_regime = returns.copy()
     all_returns_with_regime[regime_returns.name] = regime_returns
     regime_summary = performance_summary(all_returns_with_regime)
-    regime_metrics = regime_summary.loc[regime_returns.name]
 
     print(f"\n=== Regime-Switching Portfolio (rebalanced across Excess CAPE Yield ranges, {len(regime_returns)} months) ===")
     print("Performance summary:")
     print(format_summary(regime_summary).to_string())
 
-    regime_growth = (1.0 + regime_returns).cumprod()
-
     ecy_percentile = ecy.rank(pct=True)
     ecy_value_a, ecy_value_b, ecy_value_returns = analyze_and_report_softmax(
         returns, ecy, "Softmax Weights (Excess CAPE Yield)")
-    ecy_value_returns.name = "Softmax Weights (ECY)"
-    ecy_value_metrics = performance_summary(ecy_value_returns.to_frame()).iloc[0]
-    ecy_value_growth = (1.0 + ecy_value_returns).cumprod()
-    plot_softmax_weights(
-        ecy_value_a, ecy_value_b, ecy,
-        xlabel="Excess CAPE Yield (%)", title="Portfolio Weights vs Excess CAPE Yield",
-    )
-
     ecy_percentile_a, ecy_percentile_b, ecy_percentile_returns = analyze_and_report_softmax(
         returns, ecy_percentile, "Softmax Weights (Excess CAPE Yield Percentile)")
-    ecy_percentile_returns.name = "Softmax Weights (ECY Percentile)"
-    ecy_percentile_metrics = performance_summary(ecy_percentile_returns.to_frame()).iloc[0]
-    ecy_percentile_growth = (1.0 + ecy_percentile_returns).cumprod()
-    plot_softmax_weights(
-        ecy_percentile_a, ecy_percentile_b, ecy_percentile,
-        xlabel="Excess CAPE Yield (%)", title="Portfolio Weights vs Excess CAPE Yield Percentile",
+
+    # Outer (optimization) bootstrap: re-optimize every strategy on fresh bootstrap copies of the
+    # history and average the optimized portfolios (bagging) to regularize the in-sample optima.
+    print(f"\n\n=== Bagged Portfolios (re-optimized on {BOOTSTRAP_OPT_ITERATIONS} circular-block "
+          f"bootstrap copies, block size={BOOTSTRAP_BLOCK_SIZE} months) ===")
+    bagged = bag_optimized_portfolios(returns, ecy, DEFAULT_QUANTILES)
+
+    print("Bagged optimal weights (max Sharpe, bootstrap-average):")
+    print(bagged["full"].map(lambda w: f"{w:.2%}").to_string())
+    for (label, _), bucket_w in zip(quantile_buckets(ecy, DEFAULT_QUANTILES), bagged["regime"]):
+        print(f"\nBagged optimal weights (Excess CAPE Yield {label}, bootstrap-average):")
+        print(bucket_w.map(lambda w: f"{w:.2%}").to_string())
+
+    bagged_full_returns = returns @ bagged["full"]
+    bagged_full_returns.name = "Bagged Full-Period Portfolio"
+    bagged_full_summary = report_portfolio(returns, bagged_full_returns, "Bagged Full-Period Portfolio")
+    bagged_full_metrics = bagged_full_summary.loc[bagged_full_returns.name]
+    bagged_full_growth = (1.0 + bagged_full_returns).cumprod()
+
+    bagged_regime_returns = evaluate_regime_switching(returns, ecy, DEFAULT_QUANTILES, bagged["regime"])
+    bagged_regime_returns.name = "Bagged Regime-Switching Portfolio"
+    bagged_regime_summary = report_portfolio(returns, bagged_regime_returns, "Bagged Regime-Switching Portfolio")
+    bagged_regime_metrics = bagged_regime_summary.loc[bagged_regime_returns.name]
+    bagged_regime_growth = (1.0 + bagged_regime_returns).cumprod()
+
+    bagged_ecy_value_returns = softmax_ensemble_portfolio_returns(returns, bagged["ecy_value"], ecy)
+    bagged_ecy_value_returns.name = "Bagged Softmax Weights (ECY)"
+    bagged_ecy_value_summary = report_portfolio(returns, bagged_ecy_value_returns, "Bagged Softmax Weights (Excess CAPE Yield)")
+    bagged_ecy_value_metrics = bagged_ecy_value_summary.loc[bagged_ecy_value_returns.name]
+    bagged_ecy_value_growth = (1.0 + bagged_ecy_value_returns).cumprod()
+    plot_softmax_ensemble_weights(
+        bagged["ecy_value"], ecy,
+        xlabel="Excess CAPE Yield (%)", title="Bagged Portfolio Weights vs Excess CAPE Yield",
+    )
+
+    bagged_ecy_percentile_returns = softmax_ensemble_portfolio_returns(returns, bagged["ecy_percentile"], ecy_percentile)
+    bagged_ecy_percentile_returns.name = "Bagged Softmax Weights (ECY Percentile)"
+    bagged_ecy_percentile_summary = report_portfolio(returns, bagged_ecy_percentile_returns, "Bagged Softmax Weights (Excess CAPE Yield Percentile)")
+    bagged_ecy_percentile_metrics = bagged_ecy_percentile_summary.loc[bagged_ecy_percentile_returns.name]
+    bagged_ecy_percentile_growth = (1.0 + bagged_ecy_percentile_returns).cumprod()
+    plot_softmax_ensemble_weights(
+        bagged["ecy_percentile"], ecy_percentile,
+        xlabel="Excess CAPE Yield (%)", title="Bagged Portfolio Weights vs Excess CAPE Yield Percentile",
         x_axis_map=lambda grid: ecy.quantile(grid).to_numpy(),
     )
 
-    print(f"\n=== Block Bootstrap Confidence Intervals "
+    # Evaluation bootstrap: a second, independent block bootstrap estimating confidence intervals
+    # around the performance of the bagged (fixed) portfolios on fresh resampled histories.
+    print(f"\n=== Block Bootstrap Confidence Intervals of the Bagged Portfolios "
           f"(block size={BOOTSTRAP_BLOCK_SIZE} months, {BOOTSTRAP_ITERATIONS} iterations, "
           f"{BOOTSTRAP_CI_LEVEL:.0%} CI) ===")
     bootstrap = run_block_bootstrap(
-        returns, ecy, full_weights, bucket_weights_list,
-        (ecy_value_a, ecy_value_b), (ecy_percentile_a, ecy_percentile_b), DEFAULT_QUANTILES,
+        returns, ecy, bagged["full"], bagged["regime"],
+        bagged["ecy_value"], bagged["ecy_percentile"], DEFAULT_QUANTILES,
     )
 
     full_growth_ci = growth_ci_band(bootstrap["full_growth"], returns.index)
-    plot_normalized(prices, portfolio_growth, ci_band=full_growth_ci)
+    plot_normalized(prices, bagged_full_growth, title="Normalized Performance — Bagged Full-Period Portfolio (start = 100)",
+                    ci_band=full_growth_ci)
 
     regime_growth_ci = growth_ci_band(bootstrap["regime_growth"], returns.index)
     plot_normalized(
-        prices, regime_growth, title="Normalized Performance \u2014 Regime-Switching Portfolio (start = 100)",
+        prices, bagged_regime_growth, title="Normalized Performance — Bagged Regime-Switching Portfolio (start = 100)",
         ci_band=regime_growth_ci,
     )
 
     ecy_value_growth_ci = growth_ci_band(bootstrap["ecy_value_growth"], returns.index)
     plot_normalized(
-        prices, ecy_value_growth, title="Normalized Performance \u2014 Softmax Weights (Excess CAPE Yield, start = 100)",
+        prices, bagged_ecy_value_growth, title="Normalized Performance — Bagged Softmax Weights (Excess CAPE Yield), start = 100",
         ci_band=ecy_value_growth_ci,
     )
 
     ecy_percentile_growth_ci = growth_ci_band(bootstrap["ecy_percentile_growth"], returns.index)
     plot_normalized(
-        prices, ecy_percentile_growth,
-        title="Normalized Performance \u2014 Softmax Weights (Excess CAPE Yield Percentile, start = 100)",
+        prices, bagged_ecy_percentile_growth,
+        title="Normalized Performance — Bagged Softmax Weights (Excess CAPE Yield Percentile), start = 100",
         ci_band=ecy_percentile_growth_ci,
     )
 
-    print("\nFull-Period Optimal Portfolio performance:")
-    print(format_ci_table(summarize_bootstrap_ci(full_metrics, bootstrap["full_metrics"])).to_string())
+    print("\nBagged Full-Period Optimal Portfolio performance:")
+    print(format_ci_table(summarize_bootstrap_ci(bagged_full_metrics, bootstrap["full_metrics"])).to_string())
 
-    print("\nRegime-Switching Portfolio performance:")
-    print(format_ci_table(summarize_bootstrap_ci(regime_metrics, bootstrap["regime_metrics"])).to_string())
+    print("\nBagged Regime-Switching Portfolio performance:")
+    print(format_ci_table(summarize_bootstrap_ci(bagged_regime_metrics, bootstrap["regime_metrics"])).to_string())
 
-    print("\nSoftmax Weights (Excess CAPE Yield) performance:")
-    print(format_ci_table(summarize_bootstrap_ci(ecy_value_metrics, bootstrap["ecy_value_metrics"])).to_string())
+    print("\nBagged Softmax Weights (Excess CAPE Yield) performance:")
+    print(format_ci_table(summarize_bootstrap_ci(bagged_ecy_value_metrics, bootstrap["ecy_value_metrics"])).to_string())
 
-    print("\nSoftmax Weights (Excess CAPE Yield Percentile) performance:")
-    print(format_ci_table(summarize_bootstrap_ci(ecy_percentile_metrics, bootstrap["ecy_percentile_metrics"])).to_string())
+    print("\nBagged Softmax Weights (Excess CAPE Yield Percentile) performance:")
+    print(format_ci_table(summarize_bootstrap_ci(bagged_ecy_percentile_metrics, bootstrap["ecy_percentile_metrics"])).to_string())
 
     scan = scan_quantile_counts(returns, ecy, max_quantiles=5)
     print("\n=== Regime-Switching Portfolio: scanning 1-5 equidistant quantiles ===")
