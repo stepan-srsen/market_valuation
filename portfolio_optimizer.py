@@ -42,8 +42,8 @@ YFINANCE_TICKERS = [
 # factor indices to load. Comment out entries to exclude them from the optimization.
 # the files from msci.com have to be present in the data_cache folder as they cannot be downloaded automatically and no proxy has long enough history
 MSCI_INDICES = [
-#    "MSCI World Index", # from long-term perspective, highly correlated with MSCI World Momentum and Dividend but with slightly worse Sharpe ratio
-#    "MSCI World Value Index", # from long-term perspective, highly correlated with MSCI World High Dividend but with slightly worse Sharpe ratio
+    "MSCI World Index", # from long-term perspective, highly correlated with MSCI World Momentum and Dividend but with slightly worse Sharpe ratio
+    "MSCI World Value Index", # from long-term perspective, highly correlated with MSCI World High Dividend but with worse Sharpe ratio
     "MSCI World Momentum Index",
     "MSCI World Energy Index",
     "MSCI World High Dividend Yield Index",
@@ -672,6 +672,37 @@ def plot_softmax_ensemble_weights(
     plt.show()
 
 
+def plot_regime_switching_weights(
+    bucket_weights: list[pd.Series], ecy: pd.Series, quantiles=DEFAULT_QUANTILES,
+    xlabel: str = "Excess CAPE Yield (%)",
+    title: str = "Portfolio Weights vs Excess CAPE Yield (Regime-Switching)",
+) -> None:
+    """Plot each asset's Regime-Switching weight as a step function of the Excess CAPE Yield.
+
+    bucket_weights holds one weight vector per ECY bucket, ordered from lowest to highest ECY
+    (e.g. the bagged per-bucket weights). Each bucket has constant weights between its quantile
+    thresholds, so every asset's weight function is a step function switching at the thresholds.
+    """
+    thresholds = ecy.quantile(list(quantiles)).to_numpy()
+    x_edges = np.concatenate([[ecy.min()], thresholds, [ecy.max()]])
+    weight_matrix = pd.DataFrame(bucket_weights)  # rows = buckets (low to high ECY), columns = assets
+    # Repeat the last bucket's weights so the step extends flat to the upper x edge (steps-post).
+    step_weights = np.vstack([weight_matrix.to_numpy(), weight_matrix.to_numpy()[-1]])
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for i, asset in enumerate(weight_matrix.columns):
+        ax.step(x_edges, step_weights[:, i], where="post", label=asset)
+    for threshold in thresholds:
+        ax.axvline(threshold, color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Weight")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_normalized(
     prices: pd.DataFrame,
     portfolio_growth: pd.Series,
@@ -785,6 +816,10 @@ def main() -> None:
     bagged_regime_summary = report_portfolio(returns, bagged_regime_returns, "Bagged Regime-Switching Portfolio")
     bagged_regime_metrics = bagged_regime_summary.loc[bagged_regime_returns.name]
     bagged_regime_growth = (1.0 + bagged_regime_returns).cumprod()
+    plot_regime_switching_weights(
+        bagged["regime"], ecy, DEFAULT_QUANTILES,
+        title="Bagged Portfolio Weights vs Excess CAPE Yield (Regime-Switching)",
+    )
 
     bagged_ecy_value_returns = softmax_ensemble_portfolio_returns(returns, bagged["ecy_value"], ecy)
     bagged_ecy_value_returns.name = "Bagged Softmax Weights (ECY)"
