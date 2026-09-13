@@ -28,7 +28,7 @@ CACHE_DIR.mkdir(exist_ok=True)
 
 # yfinance tickers loaded alongside the MSCI factor indices, as (ticker, series name) pairs.
 YFINANCE_TICKERS = [
-    ("^NDX", "Nasdaq 100"),
+    # ("^NDX", "Nasdaq 100"), # Hihgly correlated with MSCI World Information Technology
     ("GC=F", "Gold"),
     #("SI=F", "Silver"), # from long-term perspective, silver is highly correlated with gold but more volatile
     # ("^GSPC", "S&P 500"), # MSCI world is similar but more diversified than S&P 500
@@ -42,12 +42,17 @@ YFINANCE_TICKERS = [
 # factor indices to load. Comment out entries to exclude them from the optimization.
 # the files from msci.com have to be present in the data_cache folder as they cannot be downloaded automatically and no proxy has long enough history
 MSCI_INDICES = [
-#    "MSCI World Index", # from long-term perspective, highly correlated with MSCI World Momentum and Enhanced Value but with slightly worse Sharpe ratio
-#    "MSCI World Value Index", # from long-term perspective, highly correlated with MSCI World High Dividend and MSCI World Enhanced Value Index but with worse Sharpe ratio
-    "MSCI World Enhanced Value Index", # from long-term perspective, highly correlated with MSCI World High Dividend but with worse Sharpe ratio
-#    "MSCI World High Dividend Yield Index", # from long-term perspective, highly correlated with MSCI World Enhanced Value but with worse Sharpe ratio
+    # "MSCI World Index", # from long-term perspective, highly correlated with MSCI World Momentum and Enhanced Value but with slightly worse Sharpe ratio
+    # "MSCI World High Dividend Yield Index", # from long-term perspective, highly correlated with MSCI World Enhanced Value but with worse Sharpe ratio
+    # "MSCI World Value Index", # from long-term perspective, highly correlated with MSCI World High Dividend and MSCI World Enhanced Value Index but with worse Sharpe ratio
+    "MSCI World Enhanced Value Index", # from long-term perspective, highly correlated with MSCI World High Dividend but with better Sharpe ratio
+    # "MSCI World Minimum Volatility Index", # not very good performance but low volatility
+    # "MSCI World Small Cap Index", # highly correlated with MSCI World Enhanced Value but sligthly worse Sharpe ratio
+    "MSCI World Momentum Index", # similar to MSCI Quality but Momentum seems better in the long-term (looking back to 1975)
+    # "MSCI World Quality Index", # similar to MSCI Momentum
+    # "MSCI World Communication Services Index", # not very performant
+    "MSCI World Information Technology Index", # highly correlated with Nasdaq 100
     "MSCI World Energy Index",
-    "MSCI World Momentum Index",
 ]
 
 # Annualized risk-free rate assumption used in the Sharpe ratio calculation.
