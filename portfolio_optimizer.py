@@ -28,9 +28,9 @@ CACHE_DIR.mkdir(exist_ok=True)
 
 # yfinance tickers loaded alongside the MSCI factor indices, as (ticker, series name) pairs.
 YFINANCE_TICKERS = [
+    ("^NDX", "Nasdaq 100"),
     ("GC=F", "Gold"),
     #("SI=F", "Silver"), # from long-term perspective, silver is highly correlated with gold but more volatile
-    ("^NDX", "Nasdaq 100"),
     # ("^GSPC", "S&P 500"), # MSCI world is similar but more diversified than S&P 500
     # ("ZN=F", "10-Year Treasury Bond Futures"), # ~(7-10y)
     # ("ZB=F", "30-Year Treasury Bond Futures"), # ~(15-25y)
@@ -42,11 +42,12 @@ YFINANCE_TICKERS = [
 # factor indices to load. Comment out entries to exclude them from the optimization.
 # the files from msci.com have to be present in the data_cache folder as they cannot be downloaded automatically and no proxy has long enough history
 MSCI_INDICES = [
-    "MSCI World Index", # from long-term perspective, highly correlated with MSCI World Momentum and Dividend but with slightly worse Sharpe ratio
-    "MSCI World Value Index", # from long-term perspective, highly correlated with MSCI World High Dividend but with worse Sharpe ratio
-    "MSCI World Momentum Index",
+#    "MSCI World Index", # from long-term perspective, highly correlated with MSCI World Momentum and Enhanced Value but with slightly worse Sharpe ratio
+#    "MSCI World Value Index", # from long-term perspective, highly correlated with MSCI World High Dividend and MSCI World Enhanced Value Index but with worse Sharpe ratio
+    "MSCI World Enhanced Value Index", # from long-term perspective, highly correlated with MSCI World High Dividend but with worse Sharpe ratio
+#    "MSCI World High Dividend Yield Index", # from long-term perspective, highly correlated with MSCI World Enhanced Value but with worse Sharpe ratio
     "MSCI World Energy Index",
-    "MSCI World High Dividend Yield Index",
+    "MSCI World Momentum Index",
 ]
 
 # Annualized risk-free rate assumption used in the Sharpe ratio calculation.
@@ -746,6 +747,29 @@ def plot_normalized(
     plt.show()
 
 
+def plot_correlation_heatmap(returns: pd.DataFrame, title: str = "Correlation Matrix (Monthly Returns)") -> None:
+    """Plot the pairwise correlation matrix of the return series as a color-coded heatmap."""
+    corr = returns.corr()
+
+    fig, ax = plt.subplots(figsize=(9, 7))
+    im = ax.imshow(corr.to_numpy(), cmap="RdBu_r", vmin=-1.0, vmax=1.0)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Correlation")
+
+    ax.set_xticks(range(len(corr.columns)), corr.columns, rotation=45, ha="right")
+    ax.set_yticks(range(len(corr.index)), corr.index)
+
+    # Annotate each cell; pick text color for contrast against the cell background.
+    for i in range(len(corr.index)):
+        for j in range(len(corr.columns)):
+            value = corr.iloc[i, j]
+            ax.text(j, i, f"{value:.2f}", ha="center", va="center",
+                    color="white" if abs(value) > 0.6 else "black", fontsize=9)
+
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.show()
+
+
 def main() -> None:
     prices = load_all_prices()
     returns = prices.pct_change().dropna(how="any")
@@ -765,6 +789,8 @@ def main() -> None:
     print(f"Common date range: {prices.index.min().date()} to {prices.index.max().date()} "
           f"({len(returns)} months)")
     print(f"Latest Excess CAPE Yield: {ecy.iloc[-1]:.2f}%\n")
+
+    plot_correlation_heatmap(returns)
 
     full_weights, portfolio_returns = analyze_and_report(returns, "Full Period")
 
