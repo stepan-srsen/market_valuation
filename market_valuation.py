@@ -438,7 +438,7 @@ def common_date_range(*datasets):
         raise ValueError("Datasets do not share a common date range.")
     return [data.loc[(data.index >= common_start) & (data.index <= common_end)] for data in datasets]
 
-def plot_dual_axis(left_datasets, right_datasets=[], bear_markets=None, x_axis_labels=None, normalize_left=False, normalize_right=False, from_maxmin=True) -> None:
+def plot_dual_axis(left_datasets, right_datasets=[], bear_markets=None, x_axis_labels=None, normalize_left=False, normalize_right=False, plot_from="max") -> None:
     """Plot datasets on dual y-axes with optional normalization.
     
     Args:
@@ -448,21 +448,41 @@ def plot_dual_axis(left_datasets, right_datasets=[], bear_markets=None, x_axis_l
         x_axis_labels: Dictionary of {label: date} for significant events on x-axis
         normalize_left: If True, normalize left axis datasets to their maximum
         normalize_right: If True, normalize right axis datasets to their maximum
-        from_maxmin: If True, set plot start date to max of left/right min dates; else min of left/right min dates
+        plot_from: Plot start date, either a predefined mode ("min"/"max": min/max of all
+               datasets' minima, "min_left"/"max_left": min/max of left datasets' minima,
+               "min_right"/"max_right": min/max of right datasets' minima),
+               or a specific date (datetime, Timestamp, or date string)
     """
+    # Predefined values for the plot_from argument (plot start date selection)
+    start_modes = {
+        "min": ("min", "all"),
+        "max": ("max", "all"),
+        "min_left": ("min", "left"),
+        "max_left": ("max", "left"),
+        "min_right": ("min", "right"),
+        "max_right": ("max", "right"),
+    }
     # Create figure and axis
     fig, ax1 = plt.subplots(figsize=(14, 8))
     # Convert single datasets to lists
     left_datasets = left_datasets if isinstance(left_datasets, list) else [left_datasets]
     right_datasets = right_datasets if isinstance(right_datasets, list) else [right_datasets]
 
-    plot_start = min(ds.index.min() for ds in left_datasets)
-    if right_datasets:
-        right_min = min(ds.index.min() for ds in right_datasets)
-        if from_maxmin:
-            plot_start = max(plot_start, right_min)
-        else:
-            plot_start = min(plot_start, right_min)
+    # Determine the plot start date
+    if isinstance(plot_from, str) and plot_from in start_modes:
+        aggregate, scope = start_modes[plot_from]
+        sources = {"all": left_datasets + right_datasets, "left": left_datasets, "right": right_datasets}[scope]
+        if not sources:
+            raise ValueError(f"No datasets available to resolve plot_from={plot_from!r}.")
+        minima = [ds.index.min() for ds in sources]
+        plot_start = max(minima) if aggregate == "max" else min(minima)
+    elif isinstance(plot_from, (dt.datetime, pd.Timestamp)):
+        plot_start = pd.Timestamp(plot_from)
+    elif isinstance(plot_from, str):
+        # Assume any other string is a parseable date
+        plot_start = pd.Timestamp(plot_from)
+    else:
+        raise ValueError(f"Invalid plot_from value {plot_from!r}: expected one of {sorted(start_modes)} or a date.")
     plot_end = max(ds.index.max() for ds in left_datasets + right_datasets)
     
     # Normalize function
@@ -482,6 +502,11 @@ def plot_dual_axis(left_datasets, right_datasets=[], bear_markets=None, x_axis_l
     if normalize_right:
         right_datasets = [normalize_dataset(ds) for ds in right_datasets]
     
+    # Slice datasets to the plot window so the y-axis autoscales to visible data only
+    # (done after normalization so the normalization baseline stays the full-history max)
+    left_datasets = [ds.loc[(ds.index >= plot_start) & (ds.index <= plot_end)] for ds in left_datasets]
+    right_datasets = [ds.loc[(ds.index >= plot_start) & (ds.index <= plot_end)] for ds in right_datasets]
+    
     # Plot left axis datasets
     left_color = "tab:blue"
     left_colors = plt.cm.Blues(np.linspace(1.0, 0.35, len(left_datasets)))
@@ -500,7 +525,7 @@ def plot_dual_axis(left_datasets, right_datasets=[], bear_markets=None, x_axis_l
             left_labels.append(label)
         else:
             label = getattr(data, "name", None) or f"Left {idx+1}"
-            data.plot(ax=ax1, color=left_colors[idx], label=label, legend=False)
+            ax1.plot(data.index, data.to_numpy(), color=left_colors[idx], label=label)
             left_labels.append(label)
     
     left_ylabel = "Normalized" if normalize_left else (left_labels[0] if len(left_labels) == 1 else "Left Axis")
@@ -530,7 +555,7 @@ def plot_dual_axis(left_datasets, right_datasets=[], bear_markets=None, x_axis_l
                 right_labels.append(label)
             else:
                 label = getattr(data, "name", None) or f"Right {idx+1}"
-                data.plot(ax=ax2, color=right_colors[idx], alpha=0.7, label=label, legend=False)
+                ax2.plot(data.index, data.to_numpy(), color=right_colors[idx], alpha=0.7, label=label)
                 right_labels.append(label)
         
         right_ylabel = "Normalized" if normalize_right else (right_labels[0] if len(right_labels) == 1 else "Right Axis")
@@ -608,17 +633,16 @@ if __name__ == "__main__":
     # plot_dual_axis(sp500, [excess_cape_yield, excess_cape_yield5, excess_cape_yield3, excess_cape_yield1], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
     plot_dual_axis(sp500, [excess_cape_yield, excess_cape_yield5, excess_cape_yield4, excess_cape_yield3, excess_cape_yield2, excess_cape_yield1], bear_markets, x_axis_labels=x_axis_labels, normalize_right=False)
 
-
     # gold = fetch_yfinance('GC=F').resample("D").ffill().rename("Gold")
     # gold = fit_exponential(gold, detrend=False, trends=True)
     # silver = fetch_yfinance('SI=F').resample("D").ffill().rename("Silver")
     # silver = fit_exponential(silver, detrend=False, trends=True)
-    # plot_dual_axis([gold], [], x_axis_labels=FINANCIAL_CRISES, normalize_left=False, normalize_right=False, from_maxmin=False)
+    # plot_dual_axis([gold], [], x_axis_labels=FINANCIAL_CRISES, normalize_left=False, normalize_right=False, plot_from="min")
 
     # alphabet = fetch_yfinance('GOOGL').resample("D").ffill().rename("Alphabet")
     # alphabet = alphabet[alphabet.index >= pd.Timestamp("2015-01-01")]
     # alphabet = fit_exponential(alphabet, detrend=False, trends=True)
-    # plot_dual_axis([alphabet], [], x_axis_labels=FINANCIAL_CRISES, normalize_left=False, normalize_right=False, from_maxmin=False)
+    # plot_dual_axis([alphabet], [], x_axis_labels=FINANCIAL_CRISES, normalize_left=False, normalize_right=False, plot_from="min")
 
 
 
