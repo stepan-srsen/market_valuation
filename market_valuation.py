@@ -209,7 +209,7 @@ def get_CPI_scaling() -> pd.Series:
 def get_inflation(averaging_years=10) -> float:
     """Get the annual inflation rate based on CPI averaged over the last `span` months."""
     cpi = fetch_CPI()
-    ratio = cpi / cpi.shift(averaging_years*365)
+    ratio = cpi / cpi.shift(int(averaging_years*365))
     ratio_annualized = ratio.dropna() ** (1/averaging_years)
     inflation = ratio_annualized - 1.0
     return inflation.rename("Inflation")
@@ -244,7 +244,7 @@ def calc_cape_ratio(averaging_years: int = 10) -> pd.Series:
     real_earnings = earnings * (latest_cpi / cpi)
 
     # Calculate rolling average of real earnings
-    avg_real_earnings = real_earnings.rolling(window=averaging_years * 365, min_periods=averaging_years * 365).mean()
+    avg_real_earnings = real_earnings.rolling(window=int(averaging_years * 365), min_periods=int(averaging_years * 365)).mean()
     
     # Calculate CAPE ratio
     cape_ratio = real_prices / avg_real_earnings
