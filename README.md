@@ -1,5 +1,5 @@
 # Market Valuation Tool
-Python tool for analysis of stock market valuation. It is designed mainly for the US stock market. It is just a simple python tool with several functions for personal analyses without any guarantee. It allows the user to fetch and analyse up-to-date financial data.
+Python tool for analysis of stock market valuation and portfolio optimization. It is designed mainly for the US stock market. It is just a simple python tool with several functions for personal analyses without any guarantee. It allows the user to fetch and analyse up-to-date financial data.
 
 The author is not a registered investment advisers and does not guarantee the accuracy, correctness, or completeness of the metrics, data, methodology, code or any other part of the repository. Individual investment decisions are best made with the help of a professional investment adviser.
 
@@ -20,5 +20,8 @@ more to come
 - Error bars
 - Dual-axis plotting
 
+## Portfolio Optimizer
+A new tool for portfolio optimization maximizing the Sharpe ratio. It includes global portfolio optimization and conditional portfolio composition based on excess CAPE yield. It uses bootstrap simulations for robust statistics. This tool is very fresh and not validated.
+
 ## Dependencies
-The tool is dependent on some standard and basic libraries + few libraries for fetching up-to-date financial data. Since the APIs to the financial data providers change frequently, it is recommended to use the most up-to-date versions of the `yfinance` and `wbdata` libraries.
+The tool is dependent on some standard and basic libraries + few libraries for fetching up-to-date financial data. Since the APIs to the financial data providers change frequently, it is recommended to use the most up-to-date versions of the libraries (e.g. `yfinance`).

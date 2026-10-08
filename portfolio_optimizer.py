@@ -11,7 +11,6 @@ volatility, Sharpe ratio and maximum drawdown for the optimal portfolio and its 
 
 # TODO: improve softmax portfolio optimization based on literature
 
-import datetime as dt
 import glob
 from collections.abc import Callable
 from pathlib import Path
@@ -19,12 +18,10 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from scipy.optimize import minimize, minimize_scalar
 
-DATA_DIR = Path(__file__).parent / "data"
-CACHE_DIR = Path(__file__).parent / "data_cache"
-CACHE_DIR.mkdir(exist_ok=True)
+from data import CACHE_DIR, fetch_yfinance_monthly, load_msci_index
+from market_valuation import calc_excess_cape_yield
 
 # yfinance tickers loaded alongside the MSCI factor indices, as (ticker, series name) pairs.
 YFINANCE_TICKERS = [
@@ -76,55 +73,6 @@ BOOTSTRAP_SCAN_ITERATIONS = 200
 # bootstrap. Kept lower than BOOTSTRAP_ITERATIONS since every copy reruns all the optimizers
 # (the softmax fits dominate the cost).
 BOOTSTRAP_OPT_ITERATIONS = 200
-
-def load_msci_index(path: Path) -> pd.Series:
-    """Load a monthly MSCI index export (xlsx) and return a Series indexed by month Period."""
-    df = pd.read_excel(path, header=5, usecols=[0, 1])
-    df.columns = ["Date", "Price"]
-    df = df.dropna(subset=["Date", "Price"])
-    df["Date"] = pd.to_datetime(df["Date"])
-    name = Path(path).name.split(" - ")[1]  # e.g. "MSCI World Value Index"
-    series = pd.Series(df["Price"].values, index=df["Date"].dt.to_period("M"), name=name)
-    return series
-
-
-def fetch_yfinance_monthly(ticker: str, name: str) -> pd.Series:
-    """Download daily closes for ticker via yfinance (cached locally, refreshed once per day) and return monthly closes."""
-    cache_path = CACHE_DIR / f"{ticker.replace('^', '').replace('=', '_')}.pkl"
-
-    should_download = True
-    if cache_path.exists():
-        file_mod_time = dt.datetime.fromtimestamp(cache_path.stat().st_mtime)
-        if file_mod_time.date() == dt.datetime.now().date():
-            should_download = False
-
-    if should_download:
-        data = yf.download(ticker, auto_adjust=True, period="max", interval="1d")
-        if data.empty:
-            raise ValueError(f"No data returned for {ticker}.")
-        data.to_pickle(cache_path)
-    else:
-        data = pd.read_pickle(cache_path)
-
-    if isinstance(data.columns, pd.MultiIndex):
-        closes = data["Close"][ticker].dropna()
-    else:
-        closes = data["Close"].dropna()
-
-    monthly = closes.groupby(closes.index.to_period("M")).last()
-    monthly.name = name
-    return monthly
-
-
-def load_excess_cape_yield(path: Path = DATA_DIR / "ie_data.xls") -> pd.Series:
-    """Load Shiller's monthly excess CAPE yield (in %) and return a Series indexed by month Period."""
-    df = pd.read_excel(path, sheet_name="Data", header=7)
-    df = df.dropna(subset=["Date", "Yield"])
-    year = df["Date"].astype(int)
-    month = ((df["Date"] - year) * 100).round().astype(int)  # dates are encoded as YYYY.MM
-    period = pd.PeriodIndex.from_fields(year=year, month=month, freq="M")
-    return pd.Series(df["Yield"].values * 100, index=period, name="Excess CAPE Yield")
-
 
 def load_all_prices() -> pd.DataFrame:
     """Load all constituent price series and align them to their maximum common date range."""
@@ -779,8 +727,9 @@ def main() -> None:
     prices = load_all_prices()
     returns = prices.pct_change().dropna(how="any")
 
-    ecy = load_excess_cape_yield()
-    ecy.index = ecy.index.to_timestamp(how="end").normalize()
+    ecy = calc_excess_cape_yield(averaging_years=10)
+    # Resample to month-end timestamps (matching the returns index) and convert to percent.
+    ecy = (ecy.resample("ME").last() * 100).rename("Excess CAPE Yield")
 
     # Align the excess CAPE yield with the existing series' common date range.
     common_dates = returns.index.intersection(ecy.index)
